@@ -1,6 +1,6 @@
 {
   "name": "@jazpiper/rules-doctor",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Node.js CLI to sync shared coding rules across multiple agent/CLI targets",
   "license": "MIT",
   "bin": {
