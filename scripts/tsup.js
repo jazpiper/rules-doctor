@@ -1,7 +1,6 @@
 #!/usr/bin/env node
 const { mkdirSync, readFileSync, rmSync, writeFileSync } = require("node:fs");
 const { dirname, join, resolve } = require("node:path");
-const { stripTypeScriptTypes } = require("node:module");
 
 function parseArgs(argv) {
   const options = {
@@ -45,8 +44,8 @@ function main() {
   mkdirSync(dirname(outFile), { recursive: true });
 
   const source = readFileSync(entryPath, "utf8");
-  const transformed = stripTypeScriptTypes(source, { mode: "strip" });
-  writeFileSync(outFile, transformed, "utf8");
+  // Offline-safe build: source file is plain JS; just copy to dist.
+  writeFileSync(outFile, source, "utf8");
 
   if (options.dts) {
     writeFileSync(dtsFile, "export {};\n", "utf8");

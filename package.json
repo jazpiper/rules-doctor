@@ -14,7 +14,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "node scripts/tsup.js src/index.ts --format cjs --dts --clean",
+    "build": "node scripts/tsup.js src/index.js --clean",
     "test": "npm run build && node --test"
   },
   "keywords": [
