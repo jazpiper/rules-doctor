@@ -1,6 +1,13 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mkdtempSync, readFileSync, existsSync, writeFileSync, mkdirSync } = require("node:fs");
+const {
+  mkdtempSync,
+  readFileSync,
+  existsSync,
+  writeFileSync,
+  mkdirSync,
+  symlinkSync,
+} = require("node:fs");
 const { tmpdir } = require("node:os");
 const { join } = require("node:path");
 const { runCli } = require("../src/index.js");
@@ -118,18 +125,6 @@ test("init --import reads existing CLAUDE.md commands", () => {
   assert.ok(existsSync(join(dir, ".agentrules", "import-report.md")));
 });
 
-test("targets list includes representative adapters", () => {
-  const dir = mkdtempSync(join(tmpdir(), "rules-doctor-"));
-  const result = run(["targets", "list"], dir);
-  assert.equal(result.exitCode, 0);
-  assert.match(result.stdout, /claude/);
-  assert.match(result.stdout, /codex/);
-  assert.match(result.stdout, /copilot/);
-  assert.match(result.stdout, /cursor/);
-  assert.match(result.stdout, /gemini/);
-  assert.match(result.stdout, /opencode/);
-});
-
 test("copilot sync preserves existing user content with marker-managed block", () => {
   const dir = mkdtempSync(join(tmpdir(), "rules-doctor-"));
   writeFileSync(
@@ -200,7 +195,7 @@ test("copilot sync reuses marker block and preserves surrounding content", () =>
   assert.equal(countMatches(content, /RULES_DOCTOR:COPILOT:END/g), 1);
 });
 
-test("init --preset copilot enables only copilot target", () => {
+test("copilot sync repairs malformed marker block with missing end marker", () => {
   const dir = mkdtempSync(join(tmpdir(), "rules-doctor-"));
   writeFileSync(
     join(dir, "package.json"),
@@ -212,50 +207,167 @@ test("init --preset copilot enables only copilot target", () => {
     "utf8",
   );
 
-  assert.equal(run(["init", "--preset", "copilot"], dir).exitCode, 0);
-
-  const rules = readFileSync(join(dir, ".agentrules", "rules.yaml"), "utf8");
-  assert.match(rules, /claude:\n\s+enabled: false/);
-  assert.match(rules, /codex:\n\s+enabled: false/);
-  assert.match(rules, /cursor:\n\s+enabled: false/);
-  assert.match(rules, /gemini:\n\s+enabled: false/);
-  assert.match(rules, /opencode:\n\s+enabled: false/);
-  assert.match(rules, /copilot:\n\s+enabled: true/);
-
-  assert.equal(run(["sync", "--write"], dir).exitCode, 0);
-  assert.ok(existsSync(join(dir, ".github", "copilot-instructions.md")));
-  assert.ok(!existsSync(join(dir, "CLAUDE.md")));
-  assert.ok(!existsSync(join(dir, "AGENTS.md")));
-  assert.ok(!existsSync(join(dir, ".cursor", "rules", "rules-doctor.mdc")));
-  assert.ok(!existsSync(join(dir, "GEMINI.md")));
-});
-
-test("preset apply copilot updates existing rules.yaml", () => {
-  const dir = mkdtempSync(join(tmpdir(), "rules-doctor-"));
+  mkdirSync(join(dir, ".github"), { recursive: true });
   writeFileSync(
-    join(dir, "package.json"),
-    JSON.stringify({
-      name: "demo",
-      private: true,
-      scripts: { lint: "echo lint", test: "echo test", build: "echo build" },
-    }) + "\n",
+    join(dir, ".github", "copilot-instructions.md"),
+    [
+      "# Team Copilot Notes",
+      "",
+      "Intro text.",
+      "",
+      "<!-- RULES_DOCTOR:COPILOT:BEGIN -->",
+      "broken managed block",
+      "",
+    ].join("\n"),
     "utf8",
   );
 
   assert.equal(run(["init"], dir).exitCode, 0);
+  assert.equal(run(["sync", "--target", "copilot", "--write"], dir).exitCode, 0);
 
-  const dryRun = run(["preset", "apply", "copilot"], dir);
-  assert.equal(dryRun.exitCode, 0);
-  assert.match(dryRun.stdout, /dry-run/i);
+  const content = readFileSync(join(dir, ".github", "copilot-instructions.md"), "utf8");
+  assert.match(content, /# Team Copilot Notes/);
+  assert.match(content, /Intro text\./);
+  assert.equal(countMatches(content, /RULES_DOCTOR:COPILOT:BEGIN/g), 1);
+  assert.equal(countMatches(content, /RULES_DOCTOR:COPILOT:END/g), 1);
+  assert.match(content, /rules-doctor Managed Rules/);
+});
 
-  const apply = run(["preset", "apply", "copilot", "--write"], dir);
-  assert.equal(apply.exitCode, 0);
-  assert.match(apply.stdout, /Updated/);
+test("rules.yaml schema errors are rejected instead of silently normalized", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rules-doctor-"));
+  writeFileSync(
+    join(dir, "package.json"),
+    JSON.stringify({
+      name: "demo",
+      private: true,
+      scripts: { lint: "echo lint", test: "echo test", build: "echo build" },
+    }) + "\n",
+    "utf8",
+  );
+  assert.equal(run(["init"], dir).exitCode, 0);
 
-  const rules = readFileSync(join(dir, ".agentrules", "rules.yaml"), "utf8");
-  assert.match(rules, /copilot:\n\s+enabled: true/);
-  assert.match(rules, /claude:\n\s+enabled: false/);
-  assert.match(rules, /codex:\n\s+enabled: false/);
+  const rulesPath = join(dir, ".agentrules", "rules.yaml");
+  const rules = readFileSync(rulesPath, "utf8");
+  writeFileSync(rulesPath, rules.replace('version: 2', 'version: "two"'), "utf8");
+
+  const check = run(["check"], dir);
+  assert.equal(check.exitCode, 1);
+  assert.match(check.stderr, /rules\.yaml validation errors:/);
+  assert.match(check.stderr, /"version" must be a number/);
+});
+
+test("rules.yaml warnings are surfaced when defaults are applied", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rules-doctor-"));
+  writeFileSync(
+    join(dir, "package.json"),
+    JSON.stringify({
+      name: "demo",
+      private: true,
+      scripts: { lint: "echo lint", test: "echo test", build: "echo build" },
+    }) + "\n",
+    "utf8",
+  );
+  assert.equal(run(["init"], dir).exitCode, 0);
+
+  const rulesPath = join(dir, ".agentrules", "rules.yaml");
+  const rules = readFileSync(rulesPath, "utf8");
+  writeFileSync(rulesPath, rules.replace(/^mission:.*\n/m, ""), "utf8");
+
+  const sync = run(["sync"], dir);
+  assert.equal(sync.exitCode, 0);
+  assert.match(sync.stdout, /rules\.yaml validation warnings:/);
+  assert.match(sync.stdout, /Missing "mission" key/);
+});
+
+test("sync --write fails early on conflicting same-path outputs", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rules-doctor-"));
+  writeFileSync(
+    join(dir, "package.json"),
+    JSON.stringify({
+      name: "demo",
+      private: true,
+      scripts: { lint: "echo lint", test: "echo test", build: "echo build" },
+    }) + "\n",
+    "utf8",
+  );
+  assert.equal(run(["init"], dir).exitCode, 0);
+
+  const rulesPath = join(dir, ".agentrules", "rules.yaml");
+  const rules = readFileSync(rulesPath, "utf8");
+  writeFileSync(rulesPath, rules.replace('path: "CLAUDE.md"', 'path: "AGENTS.md"'), "utf8");
+
+  const sync = run(["sync", "--write"], dir);
+  assert.equal(sync.exitCode, 1);
+  assert.match(sync.stdout, /Sync preflight failed:/);
+  assert.match(sync.stdout, /Conflicting outputs map to the same file/);
+});
+
+test("sync --write rejects absolute target paths", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rules-doctor-"));
+  writeFileSync(
+    join(dir, "package.json"),
+    JSON.stringify({
+      name: "demo",
+      private: true,
+      scripts: { lint: "echo lint", test: "echo test", build: "echo build" },
+    }) + "\n",
+    "utf8",
+  );
+  assert.equal(run(["init"], dir).exitCode, 0);
+
+  const rulesPath = join(dir, ".agentrules", "rules.yaml");
+  const rules = readFileSync(rulesPath, "utf8");
+  writeFileSync(rulesPath, rules.replace('path: "CLAUDE.md"', 'path: "/tmp/claude.md"'), "utf8");
+
+  const sync = run(["sync", "--target", "claude", "--write"], dir);
+  assert.equal(sync.exitCode, 1);
+  assert.match(sync.stderr, /project-relative/);
+});
+
+test("sync --write rejects target paths escaping project root", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rules-doctor-"));
+  writeFileSync(
+    join(dir, "package.json"),
+    JSON.stringify({
+      name: "demo",
+      private: true,
+      scripts: { lint: "echo lint", test: "echo test", build: "echo build" },
+    }) + "\n",
+    "utf8",
+  );
+  assert.equal(run(["init"], dir).exitCode, 0);
+
+  const rulesPath = join(dir, ".agentrules", "rules.yaml");
+  const rules = readFileSync(rulesPath, "utf8");
+  writeFileSync(rulesPath, rules.replace('path: "CLAUDE.md"', 'path: "../claude.md"'), "utf8");
+
+  const sync = run(["sync", "--target", "claude", "--write"], dir);
+  assert.equal(sync.exitCode, 1);
+  assert.match(sync.stderr, /escapes project root/);
+});
+
+test("sync --write rejects symlink traversal target paths", () => {
+  const dir = mkdtempSync(join(tmpdir(), "rules-doctor-"));
+  const outside = mkdtempSync(join(tmpdir(), "rules-doctor-outside-"));
+  symlinkSync(outside, join(dir, "linked"));
+  writeFileSync(
+    join(dir, "package.json"),
+    JSON.stringify({
+      name: "demo",
+      private: true,
+      scripts: { lint: "echo lint", test: "echo test", build: "echo build" },
+    }) + "\n",
+    "utf8",
+  );
+  assert.equal(run(["init"], dir).exitCode, 0);
+
+  const rulesPath = join(dir, ".agentrules", "rules.yaml");
+  const rules = readFileSync(rulesPath, "utf8");
+  writeFileSync(rulesPath, rules.replace('path: "CLAUDE.md"', 'path: "linked/CLAUDE.md"'), "utf8");
+
+  const sync = run(["sync", "--target", "claude", "--write"], dir);
+  assert.equal(sync.exitCode, 1);
+  assert.match(sync.stderr, /Refusing symlink path/);
 });
 
 test("sync codex and opencode shares AGENTS.md output once", () => {
@@ -270,7 +382,7 @@ test("sync codex and opencode shares AGENTS.md output once", () => {
     "utf8",
   );
 
-  assert.equal(run(["init", "--preset", "core"], dir).exitCode, 0);
+  assert.equal(run(["init"], dir).exitCode, 0);
   const sync = run(["sync", "--target", "codex,opencode", "--write"], dir);
   assert.equal(sync.exitCode, 0);
   assert.match(sync.stdout, /shares output with/i);
@@ -280,7 +392,7 @@ test("sync codex and opencode shares AGENTS.md output once", () => {
   assert.equal(countMatches(agents, /RULES_DOCTOR:END/g), 1);
 });
 
-test("init --import with preset copilot keeps imported mission but limits targets", () => {
+test("init --import keeps imported mission text", () => {
   const dir = mkdtempSync(join(tmpdir(), "rules-doctor-"));
   writeFileSync(
     join(dir, "CLAUDE.md"),
@@ -297,12 +409,12 @@ test("init --import with preset copilot keeps imported mission but limits target
     "utf8",
   );
 
-  assert.equal(run(["init", "--import", "--preset", "copilot"], dir).exitCode, 0);
+  assert.equal(run(["init", "--import"], dir).exitCode, 0);
 
   const rules = readFileSync(join(dir, ".agentrules", "rules.yaml"), "utf8");
   assert.match(rules, /mission: "Imported mission text\."/);
+  assert.match(rules, /claude:\n\s+enabled: true/);
   assert.match(rules, /copilot:\n\s+enabled: true/);
-  assert.match(rules, /claude:\n\s+enabled: false/);
 });
 
 test("running in subdirectory still writes to project root", () => {

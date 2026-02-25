@@ -1,26 +1,29 @@
 #!/usr/bin/env node
-const { dirname, isAbsolute, resolve } = require("node:path");
-const { existsSync, mkdirSync, readFileSync, writeFileSync } = require("node:fs");
+const { dirname, isAbsolute, relative, resolve } = require("node:path");
+const { existsSync, lstatSync, mkdirSync, readFileSync, writeFileSync } = require("node:fs");
 const { ADAPTERS, ADAPTERS_BY_ID } = require("./adapters");
 
 const RULES_RELATIVE_PATH = ".agentrules/rules.yaml";
 const IMPORT_REPORT_RELATIVE_PATH = ".agentrules/import-report.md";
-const PRESET_NAMES = ["all", "core", "copilot"];
+const REQUIRED_RULE_KEYS = [
+  "version",
+  "mission",
+  "workflow",
+  "commands",
+  "done",
+  "approvals",
+  "targets",
+];
 
 function usage() {
   const targets = ADAPTERS.map((adapter) => adapter.id).join("|");
-  const presets = PRESET_NAMES.join("|");
   return [
     "rules-doctor",
     "",
     "Usage:",
-    `  rules-doctor init [--import] [--preset ${presets}]`,
-    `  rules-doctor preset apply <${presets}> [--diff] [--write]`,
+    "  rules-doctor init [--import]",
     `  rules-doctor sync [--target all|${targets}|<comma-separated-targets>] [--diff] [--write] [--backup]`,
     `  rules-doctor check [--target all|${targets}|<comma-separated-targets>] [--diff]`,
-    "  rules-doctor analyze [--strict]",
-    "  rules-doctor doctor [--strict]",
-    "  rules-doctor targets list",
     "",
     "Notes:",
     "  - sync defaults to dry-run. Add --write to apply changes.",
@@ -54,12 +57,12 @@ function readJsonFile(filePath) {
 
 function stripQuotes(value) {
   const trimmed = value.trim();
-  if (
-    (trimmed.startsWith('"') && trimmed.endsWith('"')) ||
-    (trimmed.startsWith("'") && trimmed.endsWith("'"))
-  ) {
+  if (trimmed.startsWith("'") && trimmed.endsWith("'")) {
+    return trimmed.slice(1, -1).replace(/''/g, "'");
+  }
+  if (trimmed.startsWith('"') && trimmed.endsWith('"')) {
     try {
-      return JSON.parse(trimmed.replace(/'/g, '"'));
+      return JSON.parse(trimmed);
     } catch {
       return trimmed.slice(1, -1);
     }
@@ -67,8 +70,285 @@ function stripQuotes(value) {
   return trimmed;
 }
 
+function stripInlineComment(value) {
+  const input = String(value);
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (char === "\\" && inDouble) {
+      escaped = true;
+      continue;
+    }
+
+    if (char === "'" && !inDouble) {
+      if (inSingle && input[index + 1] === "'") {
+        index += 1;
+        continue;
+      }
+      inSingle = !inSingle;
+      continue;
+    }
+
+    if (char === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+
+    if (char === "#" && !inSingle && !inDouble) {
+      const previous = index > 0 ? input[index - 1] : " ";
+      if (/\s/.test(previous)) {
+        return input.slice(0, index).trimEnd();
+      }
+    }
+  }
+
+  return input.trimEnd();
+}
+
+function splitTopLevel(value, delimiter) {
+  const input = String(value);
+  const parts = [];
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+  let braceDepth = 0;
+  let bracketDepth = 0;
+  let parenDepth = 0;
+  let last = 0;
+
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (char === "\\" && inDouble) {
+      escaped = true;
+      continue;
+    }
+
+    if (char === "'" && !inDouble) {
+      if (inSingle && input[index + 1] === "'") {
+        index += 1;
+        continue;
+      }
+      inSingle = !inSingle;
+      continue;
+    }
+
+    if (char === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+
+    if (inSingle || inDouble) {
+      continue;
+    }
+
+    if (char === "{") {
+      braceDepth += 1;
+      continue;
+    }
+    if (char === "}") {
+      braceDepth = Math.max(0, braceDepth - 1);
+      continue;
+    }
+    if (char === "[") {
+      bracketDepth += 1;
+      continue;
+    }
+    if (char === "]") {
+      bracketDepth = Math.max(0, bracketDepth - 1);
+      continue;
+    }
+    if (char === "(") {
+      parenDepth += 1;
+      continue;
+    }
+    if (char === ")") {
+      parenDepth = Math.max(0, parenDepth - 1);
+      continue;
+    }
+
+    if (char === delimiter && braceDepth === 0 && bracketDepth === 0 && parenDepth === 0) {
+      parts.push(input.slice(last, index));
+      last = index + 1;
+    }
+  }
+
+  parts.push(input.slice(last));
+  return parts;
+}
+
+function splitKeyValueLine(line, options) {
+  const opts = options || {};
+  const input = String(line);
+  let inSingle = false;
+  let inDouble = false;
+  let escaped = false;
+
+  for (let index = 0; index < input.length; index += 1) {
+    const char = input[index];
+
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+
+    if (char === "\\" && inDouble) {
+      escaped = true;
+      continue;
+    }
+
+    if (char === "'" && !inDouble) {
+      if (inSingle && input[index + 1] === "'") {
+        index += 1;
+        continue;
+      }
+      inSingle = !inSingle;
+      continue;
+    }
+
+    if (char === '"' && !inSingle) {
+      inDouble = !inDouble;
+      continue;
+    }
+
+    if (char === ":" && !inSingle && !inDouble) {
+      const next = input[index + 1];
+      if (!opts.allowTightValue && typeof next !== "undefined" && !/\s/.test(next)) {
+        continue;
+      }
+      const key = stripQuotes(input.slice(0, index).trim());
+      if (!key) {
+        return null;
+      }
+      return [key, input.slice(index + 1)];
+    }
+  }
+
+  return null;
+}
+
+function parseInlineCollection(value) {
+  const input = String(value).trim();
+  if (input.startsWith("{") && input.endsWith("}")) {
+    const inner = input.slice(1, -1).trim();
+    if (!inner) {
+      return {};
+    }
+
+    const result = {};
+    for (const entry of splitTopLevel(inner, ",")) {
+      const item = entry.trim();
+      if (!item) {
+        continue;
+      }
+
+      const pair = splitKeyValueLine(item, { allowTightValue: true });
+      if (!pair) {
+        return undefined;
+      }
+      result[pair[0]] = parseScalar(pair[1]);
+    }
+    return result;
+  }
+
+  if (input.startsWith("[") && input.endsWith("]")) {
+    const inner = input.slice(1, -1).trim();
+    if (!inner) {
+      return [];
+    }
+    return splitTopLevel(inner, ",").map((item) => parseScalar(item.trim()));
+  }
+
+  return undefined;
+}
+
+function isBlockScalarIndicator(value) {
+  const cleaned = stripInlineComment(value).trim();
+  return /^[|>][-+]?$/.test(cleaned);
+}
+
+function foldBlockLines(lines) {
+  let output = "";
+  for (const line of lines) {
+    if (line === "") {
+      output += "\n";
+      continue;
+    }
+    if (output === "" || output.endsWith("\n")) {
+      output += line;
+    } else {
+      output += ` ${line}`;
+    }
+  }
+  return output;
+}
+
+function parseBlockScalar(lines, startIndex, baseIndent, indicator) {
+  const style = String(indicator).trim().startsWith(">") ? ">" : "|";
+  const rawBlock = [];
+  let minIndent = Infinity;
+  let index = startIndex + 1;
+
+  while (index < lines.length) {
+    const rawLine = lines[index];
+    const trimmed = rawLine.trim();
+    if (!trimmed) {
+      rawBlock.push("");
+      index += 1;
+      continue;
+    }
+
+    const indent = rawLine.match(/^ */)[0].length;
+    if (indent <= baseIndent) {
+      break;
+    }
+
+    minIndent = Math.min(minIndent, indent);
+    rawBlock.push(rawLine);
+    index += 1;
+  }
+
+  if (rawBlock.length === 0) {
+    return { value: "", nextIndex: startIndex };
+  }
+
+  const normalized = rawBlock.map((line) => {
+    if (!line) {
+      return "";
+    }
+    return line.slice(Math.min(minIndent, line.match(/^ */)[0].length));
+  });
+
+  const value = style === ">" ? foldBlockLines(normalized) : normalized.join("\n");
+  return { value: value.trimEnd(), nextIndex: index - 1 };
+}
+
 function parseScalar(value) {
-  const cleaned = stripQuotes(value);
+  const withoutComment = stripInlineComment(value).trim();
+  if (!withoutComment) {
+    return "";
+  }
+
+  const inlineCollection = parseInlineCollection(withoutComment);
+  if (typeof inlineCollection !== "undefined") {
+    return inlineCollection;
+  }
+
+  const cleaned = stripQuotes(withoutComment);
   if (/^(true|false)$/i.test(cleaned)) {
     return cleaned.toLowerCase() === "true";
   }
@@ -97,8 +377,10 @@ function parseRulesText(text) {
   let section = null;
   let nested = null;
   let currentTarget = null;
+  let targetEntryIndent = null;
 
-  for (const rawLine of lines) {
+  for (let lineIndex = 0; lineIndex < lines.length; lineIndex += 1) {
+    const rawLine = lines[lineIndex];
     if (!rawLine.trim() || rawLine.trim().startsWith("#")) {
       continue;
     }
@@ -109,14 +391,15 @@ function parseRulesText(text) {
     if (indent === 0) {
       nested = null;
       currentTarget = null;
+      targetEntryIndent = null;
 
-      const top = line.match(/^([a-zA-Z0-9_-]+):(.*)$/);
+      const top = splitKeyValueLine(line);
       if (!top) {
         continue;
       }
 
-      const key = top[1];
-      const value = top[2].trim();
+      const key = top[0];
+      const value = stripInlineComment(top[1]).trim();
 
       if (!value) {
         section = key;
@@ -127,7 +410,13 @@ function parseRulesText(text) {
         }
       } else {
         section = null;
-        data[key] = parseScalar(value);
+        if (isBlockScalarIndicator(value)) {
+          const parsedBlock = parseBlockScalar(lines, lineIndex, indent, value);
+          data[key] = parsedBlock.value;
+          lineIndex = parsedBlock.nextIndex;
+        } else {
+          data[key] = parseScalar(value);
+        }
       }
       continue;
     }
@@ -138,20 +427,22 @@ function parseRulesText(text) {
     }
 
     if (section === "commands") {
-      const pair = line.match(/^([a-zA-Z0-9_-]+):(.*)$/);
+      const pair = splitKeyValueLine(line);
       if (pair) {
-        data.commands[pair[1]] = parseScalar(pair[2].trim());
+        data.commands[pair[0]] = parseScalar(pair[1]);
       }
       continue;
     }
 
     if (section === "approvals") {
-      if (line.startsWith("mode:")) {
-        data.approvals.mode = parseScalar(line.slice("mode:".length).trim());
+      const pair = splitKeyValueLine(line);
+
+      if (pair && pair[0] === "mode") {
+        data.approvals.mode = parseScalar(pair[1]);
         continue;
       }
 
-      if (line === "notes:") {
+      if (pair && pair[0] === "notes" && !stripInlineComment(pair[1]).trim()) {
         nested = "notes";
         if (!Array.isArray(data.approvals.notes)) {
           data.approvals.notes = [];
@@ -166,14 +457,20 @@ function parseRulesText(text) {
     }
 
     if (section === "targets") {
-      if (indent === 2) {
-        const target = line.match(/^([a-zA-Z0-9_-]+):(.*)$/);
-        if (!target) {
-          continue;
-        }
+      const pair = splitKeyValueLine(line);
+      if (!pair) {
+        continue;
+      }
 
-        currentTarget = target[1];
-        const maybeValue = target[2].trim();
+      const key = pair[0];
+      const maybeValue = stripInlineComment(pair[1]).trim();
+
+      if (targetEntryIndent === null) {
+        targetEntryIndent = indent;
+      }
+
+      if (indent === targetEntryIndent) {
+        currentTarget = key;
         if (!maybeValue) {
           data.targets[currentTarget] = {};
         } else {
@@ -182,14 +479,11 @@ function parseRulesText(text) {
         continue;
       }
 
-      if (indent >= 4 && currentTarget) {
-        const pair = line.match(/^([a-zA-Z0-9_-]+):(.*)$/);
-        if (pair) {
-          if (!data.targets[currentTarget] || typeof data.targets[currentTarget] !== "object") {
-            data.targets[currentTarget] = {};
-          }
-          data.targets[currentTarget][pair[1]] = parseScalar(pair[2].trim());
+      if (indent > targetEntryIndent && currentTarget) {
+        if (!data.targets[currentTarget] || typeof data.targets[currentTarget] !== "object") {
+          data.targets[currentTarget] = {};
         }
+        data.targets[currentTarget][key] = parseScalar(maybeValue);
       }
     }
   }
@@ -248,40 +542,6 @@ function createDefaultRules(scripts) {
   };
 }
 
-function getPresetTargetIds(presetName) {
-  if (presetName === "all") {
-    return ADAPTERS.map((adapter) => adapter.id);
-  }
-
-  if (presetName === "core") {
-    return ["claude", "codex", "opencode", "cursor", "gemini"];
-  }
-
-  if (presetName === "copilot") {
-    return ["copilot"];
-  }
-
-  throw new Error(`Unknown preset "${presetName}". Use one of: ${PRESET_NAMES.join(", ")}`);
-}
-
-function applyTargetPreset(rules, presetName) {
-  const enabled = new Set(getPresetTargetIds(presetName));
-  const targets = rules.targets && typeof rules.targets === "object" ? rules.targets : {};
-
-  for (const adapter of ADAPTERS) {
-    const current = normalizeTargetConfig(targets[adapter.id], adapter.defaultPath);
-    targets[adapter.id] = {
-      enabled: enabled.has(adapter.id),
-      path: current.path,
-    };
-  }
-
-  return {
-    ...rules,
-    targets,
-  };
-}
-
 function normalizeTargetConfig(source, fallbackPath) {
   if (typeof source === "string" && source.trim()) {
     return { enabled: true, path: source.trim() };
@@ -315,6 +575,20 @@ function normalizeRules(input, defaults) {
   const notes = Array.isArray(approvals.notes)
     ? approvals.notes.filter((item) => typeof item === "string")
     : defaults.approvals.notes;
+  const normalizedCommands = {};
+  for (const [name, value] of Object.entries(commands)) {
+    const normalizedName = String(name).trim();
+    if (!normalizedName || typeof value !== "string" || !value.trim()) {
+      continue;
+    }
+    normalizedCommands[normalizedName] = value.trim();
+  }
+
+  for (const required of ["lint", "test", "build"]) {
+    if (!normalizedCommands[required] && defaults.commands[required]) {
+      normalizedCommands[required] = defaults.commands[required];
+    }
+  }
 
   const targets = {};
   for (const adapter of ADAPTERS) {
@@ -340,11 +614,7 @@ function normalizeRules(input, defaults) {
     mission:
       typeof source.mission === "string" && source.mission.trim() ? source.mission : defaults.mission,
     workflow: workflow.length > 0 ? workflow : defaults.workflow,
-    commands: {
-      lint: typeof commands.lint === "string" ? commands.lint : defaults.commands.lint,
-      test: typeof commands.test === "string" ? commands.test : defaults.commands.test,
-      build: typeof commands.build === "string" ? commands.build : defaults.commands.build,
-    },
+    commands: normalizedCommands,
     done: done.length > 0 ? done : defaults.done,
     approvals: {
       mode: typeof approvals.mode === "string" ? approvals.mode : defaults.approvals.mode,
@@ -352,6 +622,190 @@ function normalizeRules(input, defaults) {
     },
     targets,
   };
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function getSuspiciousRuleLines(text) {
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const suspicious = [];
+  let blockBaseIndent = null;
+
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const indent = line.match(/^ */)[0].length;
+    const trimmed = line.trim();
+
+    if (blockBaseIndent !== null) {
+      if (!trimmed) {
+        continue;
+      }
+      if (indent > blockBaseIndent) {
+        continue;
+      }
+      blockBaseIndent = null;
+    }
+
+    if (!trimmed || trimmed.startsWith("#")) {
+      continue;
+    }
+
+    const pair = splitKeyValueLine(trimmed, { allowTightValue: true });
+    if (pair) {
+      if (isBlockScalarIndicator(pair[1])) {
+        blockBaseIndent = indent;
+      }
+      continue;
+    }
+
+    if (/^-\s+/.test(trimmed)) {
+      continue;
+    }
+
+    suspicious.push(index + 1);
+  }
+  return suspicious;
+}
+
+function validateRulesSource(source, rawText) {
+  const warnings = [];
+  const errors = [];
+
+  if (!isPlainObject(source)) {
+    errors.push("Top-level YAML must be an object.");
+    return { warnings, errors };
+  }
+
+  const keys = Object.keys(source);
+  const nonCommentLines = rawText
+    .replace(/\r\n/g, "\n")
+    .split("\n")
+    .filter((line) => line.trim() && !line.trim().startsWith("#"));
+  if (keys.length === 0 && nonCommentLines.length > 0) {
+    errors.push("No parseable keys found. Check YAML syntax and indentation.");
+  }
+
+  for (const key of REQUIRED_RULE_KEYS) {
+    if (!Object.prototype.hasOwnProperty.call(source, key)) {
+      warnings.push(`Missing "${key}" key; defaults will be applied.`);
+    }
+  }
+
+  const suspiciousLines = getSuspiciousRuleLines(rawText);
+  if (suspiciousLines.length > 0) {
+    warnings.push(
+      `Suspicious YAML line(s): ${suspiciousLines.slice(0, 8).join(", ")}${
+        suspiciousLines.length > 8 ? ", ..." : ""
+      }`,
+    );
+  }
+
+  if (Object.prototype.hasOwnProperty.call(source, "version") && typeof source.version !== "number") {
+    errors.push(`"version" must be a number.`);
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(source, "mission") &&
+    (typeof source.mission !== "string" || !source.mission.trim())
+  ) {
+    errors.push(`"mission" must be a non-empty string.`);
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(source, "workflow") &&
+    (!Array.isArray(source.workflow) || source.workflow.some((item) => typeof item !== "string"))
+  ) {
+    errors.push(`"workflow" must be an array of strings.`);
+  }
+  if (
+    Object.prototype.hasOwnProperty.call(source, "done") &&
+    (!Array.isArray(source.done) || source.done.some((item) => typeof item !== "string"))
+  ) {
+    errors.push(`"done" must be an array of strings.`);
+  }
+
+  if (Object.prototype.hasOwnProperty.call(source, "commands")) {
+    if (!isPlainObject(source.commands)) {
+      errors.push(`"commands" must be an object.`);
+    } else {
+      for (const [name, value] of Object.entries(source.commands)) {
+        if (typeof value !== "string" || !value.trim()) {
+          errors.push(`"commands.${name}" must be a non-empty string.`);
+        }
+      }
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(source, "approvals")) {
+    if (!isPlainObject(source.approvals)) {
+      errors.push(`"approvals" must be an object.`);
+    } else {
+      if (
+        Object.prototype.hasOwnProperty.call(source.approvals, "mode") &&
+        (typeof source.approvals.mode !== "string" || !source.approvals.mode.trim())
+      ) {
+        errors.push(`"approvals.mode" must be a non-empty string.`);
+      }
+      if (
+        Object.prototype.hasOwnProperty.call(source.approvals, "notes") &&
+        (!Array.isArray(source.approvals.notes) ||
+          source.approvals.notes.some((item) => typeof item !== "string"))
+      ) {
+        errors.push(`"approvals.notes" must be an array of strings.`);
+      }
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(source, "targets")) {
+    if (!isPlainObject(source.targets)) {
+      errors.push(`"targets" must be an object.`);
+    } else {
+      for (const [targetId, config] of Object.entries(source.targets)) {
+        if (typeof config === "string") {
+          if (!config.trim()) {
+            errors.push(`"targets.${targetId}" must not be empty.`);
+          }
+          continue;
+        }
+        if (!isPlainObject(config)) {
+          errors.push(`"targets.${targetId}" must be a string or object.`);
+          continue;
+        }
+        if (
+          Object.prototype.hasOwnProperty.call(config, "enabled") &&
+          typeof config.enabled !== "boolean"
+        ) {
+          errors.push(`"targets.${targetId}.enabled" must be boolean.`);
+        }
+        if (Object.prototype.hasOwnProperty.call(config, "path")) {
+          if (typeof config.path !== "string" || !config.path.trim()) {
+            errors.push(`"targets.${targetId}.path" must be a non-empty string.`);
+          }
+        } else {
+          warnings.push(`"targets.${targetId}" has no "path"; default path will be used.`);
+        }
+      }
+    }
+  }
+
+  return { warnings, errors };
+}
+
+function formatValidationMessages(validation) {
+  const lines = [];
+  if (validation.errors.length > 0) {
+    lines.push("rules.yaml validation errors:");
+    for (const error of validation.errors) {
+      lines.push(`- ${error}`);
+    }
+  }
+  if (validation.warnings.length > 0) {
+    lines.push("rules.yaml validation warnings:");
+    for (const warning of validation.warnings) {
+      lines.push(`- ${warning}`);
+    }
+  }
+  return lines.join("\n");
 }
 
 function stringifyRules(rules) {
@@ -363,13 +817,19 @@ function stringifyRules(rules) {
       .sort(),
   ];
 
+  const commandNames = Object.keys(rules.commands || {});
+  const orderedCommandNames = [
+    ...["lint", "test", "build"].filter((name) => commandNames.includes(name)),
+    ...commandNames.filter((name) => !["lint", "test", "build"].includes(name)).sort(),
+  ];
+
   const lines = [
     `version: ${quoteYaml(Number.isFinite(rules.version) ? rules.version : 2)}`,
     `mission: ${quoteYaml(rules.mission)}`,
     "workflow:",
     ...rules.workflow.map((step) => `  - ${quoteYaml(step)}`),
     "commands:",
-    ...Object.keys(rules.commands).map((name) => `  ${name}: ${quoteYaml(rules.commands[name])}`),
+    ...orderedCommandNames.map((name) => `  ${name}: ${quoteYaml(rules.commands[name])}`),
     "done:",
     ...rules.done.map((item) => `  - ${quoteYaml(item)}`),
     "approvals:",
@@ -390,33 +850,44 @@ function stringifyRules(rules) {
   return lines.join("\n");
 }
 
-function hasVerifyCommand(text) {
-  return /\b(npm run|pnpm|yarn|bun)\s+(lint|test|build)\b/i.test(text);
-}
-
-function hasNoApprovalLanguage(text) {
-  return /never ask (for )?approval|no approvals|without approval|do not ask for approval/i.test(
-    text,
-  );
-}
-
-function hasAskApprovalLanguage(text) {
-  return /ask for approval|request approval|require approval|needs approval/i.test(text);
-}
-
-function hasRequireTestsLanguage(text) {
-  return /must run tests|always run tests|run tests before done/i.test(text);
-}
-
-function hasSkipTestsLanguage(text) {
-  return /skip tests|tests optional|do not run tests/i.test(text);
-}
-
 function resolveInRoot(rootDir, filePath) {
-  if (isAbsolute(filePath)) {
-    return filePath;
+  if (typeof filePath !== "string" || !filePath.trim()) {
+    throw new Error("Target path must be a non-empty string.");
   }
-  return resolve(rootDir, filePath);
+
+  const trimmedPath = filePath.trim();
+  if (isAbsolute(trimmedPath)) {
+    throw new Error(`Target path must be project-relative: ${trimmedPath}`);
+  }
+
+  const resolvedPath = resolve(rootDir, trimmedPath);
+  const rel = relative(rootDir, resolvedPath);
+  if (rel.startsWith("..") || isAbsolute(rel)) {
+    throw new Error(`Target path escapes project root: ${trimmedPath}`);
+  }
+
+  return resolvedPath;
+}
+
+function assertNoSymlinkTraversal(rootDir, targetPath) {
+  const rel = relative(rootDir, targetPath);
+  if (!rel || rel === ".") {
+    return;
+  }
+
+  const segments = rel.split(/[/\\]+/).filter(Boolean);
+  let cursor = rootDir;
+  for (const segment of segments) {
+    cursor = resolve(cursor, segment);
+    if (!existsSync(cursor)) {
+      continue;
+    }
+    const stats = lstatSync(cursor);
+    if (stats.isSymbolicLink()) {
+      const display = relative(rootDir, cursor) || ".";
+      throw new Error(`Refusing symlink path for managed output: ${display}`);
+    }
+  }
 }
 
 function findProjectRoot(startDir) {
@@ -440,19 +911,112 @@ function ensureParentDirectory(filePath) {
   mkdirSync(dirname(filePath), { recursive: true });
 }
 
-function upsertManagedSection(existing, content, beginMarker, endMarker) {
-  const start = existing.indexOf(beginMarker);
-  const end = start >= 0 ? existing.indexOf(endMarker, start) : -1;
+function countOccurrences(text, needle) {
+  if (!needle) {
+    return 0;
+  }
+  let count = 0;
+  let cursor = 0;
+  while (true) {
+    const index = text.indexOf(needle, cursor);
+    if (index < 0) {
+      return count;
+    }
+    count += 1;
+    cursor = index + needle.length;
+  }
+}
 
-  if (start >= 0 && end > start) {
-    const before = existing.slice(0, start + beginMarker.length);
-    const after = existing.slice(end);
+function escapeRegExp(value) {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function inspectMarkerBlock(text, beginMarker, endMarker) {
+  const beginCount = countOccurrences(text, beginMarker);
+  const endCount = countOccurrences(text, endMarker);
+  const firstBegin = text.indexOf(beginMarker);
+  const firstEnd = text.indexOf(endMarker);
+
+  if (beginCount === 0 && endCount === 0) {
+    return { status: "missing", beginCount, endCount, firstBegin, firstEnd };
+  }
+  if (beginCount === 1 && endCount === 1 && firstBegin >= 0 && firstEnd > firstBegin) {
+    return { status: "valid", beginCount, endCount, firstBegin, firstEnd };
+  }
+  if (beginCount === 1 && endCount === 0) {
+    return { status: "missing-end", beginCount, endCount, firstBegin, firstEnd };
+  }
+  if (beginCount === 0 && endCount === 1) {
+    return { status: "missing-begin", beginCount, endCount, firstBegin, firstEnd };
+  }
+  if (firstBegin >= 0 && firstEnd >= 0 && firstEnd < firstBegin) {
+    return { status: "misordered", beginCount, endCount, firstBegin, firstEnd };
+  }
+  return { status: "multiple", beginCount, endCount, firstBegin, firstEnd };
+}
+
+function markerStatusIssueLabel(status) {
+  if (status === "missing") {
+    return "marker block is missing.";
+  }
+  if (status === "missing-end") {
+    return "marker block is malformed (missing end marker).";
+  }
+  if (status === "missing-begin") {
+    return "marker block is malformed (missing begin marker).";
+  }
+  if (status === "misordered") {
+    return "marker block is malformed (end marker appears before begin marker).";
+  }
+  if (status === "multiple") {
+    return "marker block is malformed (multiple marker blocks detected).";
+  }
+  return "marker block state is unknown.";
+}
+
+function removeMarkerLines(text, beginMarker, endMarker) {
+  return text
+    .split("\n")
+    .filter((line) => {
+      const trimmed = line.trim();
+      return trimmed !== beginMarker && trimmed !== endMarker;
+    })
+    .join("\n");
+}
+
+function cleanMalformedMarkerContent(existing, beginMarker, endMarker, inspection) {
+  if (inspection.status === "missing-end" && inspection.firstBegin >= 0) {
+    return existing.slice(0, inspection.firstBegin).trimEnd();
+  }
+
+  let cleaned = existing;
+  const beginPattern = escapeRegExp(beginMarker);
+  const endPattern = escapeRegExp(endMarker);
+  const sectionPattern = new RegExp(`${beginPattern}[\\s\\S]*?${endPattern}\\n?`, "g");
+  cleaned = cleaned.replace(sectionPattern, "");
+  cleaned = removeMarkerLines(cleaned, beginMarker, endMarker);
+  return cleaned.trimEnd();
+}
+
+function upsertManagedSection(existing, content, beginMarker, endMarker) {
+  const inspection = inspectMarkerBlock(existing, beginMarker, endMarker);
+  if (inspection.status === "valid") {
+    const before = existing.slice(0, inspection.firstBegin + beginMarker.length);
+    const after = existing.slice(inspection.firstEnd);
     return `${before}\n${content.trim()}\n${after}`.replace(/\n{3,}/g, "\n\n");
   }
 
-  const base = existing.trimEnd();
+  const managedBlock = `${beginMarker}\n${content.trim()}\n${endMarker}\n`;
+  if (inspection.status === "missing") {
+    const base = existing.trimEnd();
+    const prefix = base ? `${base}\n\n` : "";
+    return `${prefix}${managedBlock}`;
+  }
+
+  const cleaned = cleanMalformedMarkerContent(existing, beginMarker, endMarker, inspection);
+  const base = cleaned.trimEnd();
   const prefix = base ? `${base}\n\n` : "";
-  return `${prefix}${beginMarker}\n${content.trim()}\n${endMarker}\n`;
+  return `${prefix}${managedBlock}`;
 }
 
 function loadPackageScripts(rootDir) {
@@ -464,25 +1028,27 @@ function loadPackageScripts(rootDir) {
 }
 
 function loadRules(rootDir, options) {
+  const opts = options || {};
   const rulesFile = resolve(rootDir, RULES_RELATIVE_PATH);
   const defaults = createDefaultRules(loadPackageScripts(rootDir));
 
   if (!existsSync(rulesFile)) {
-    if (options && options.allowMissing) {
-      return {
-        rules: defaults,
-        rulesFile,
-        rulesExists: false,
-      };
-    }
     throw new Error(`Missing ${rulesFile}. Run "rules-doctor init" to create it first.`);
   }
 
-  const parsed = parseRulesText(readFileSync(rulesFile, "utf8"));
+  const rawText = readFileSync(rulesFile, "utf8");
+  const parsed = parseRulesText(rawText);
+  const validation = validateRulesSource(parsed, rawText);
+  if (validation.errors.length > 0) {
+    throw new Error(formatValidationMessages(validation));
+  }
+  if (validation.warnings.length > 0 && opts.logger && typeof opts.logger.log === "function") {
+    opts.logger.log(formatValidationMessages(validation));
+  }
+
   return {
     rules: normalizeRules(parsed, defaults),
     rulesFile,
-    rulesExists: true,
   };
 }
 
@@ -517,7 +1083,6 @@ function getTargetsFromSpec(spec) {
 function parseInitArgs(args) {
   const options = {
     importExisting: false,
-    preset: "all",
   };
 
   for (let index = 0; index < (args || []).length; index += 1) {
@@ -527,58 +1092,7 @@ function parseInitArgs(args) {
       continue;
     }
 
-    if (arg === "--preset") {
-      const value = args[index + 1];
-      if (!value) {
-        throw new Error("Missing value for --preset.");
-      }
-      if (!PRESET_NAMES.includes(value)) {
-        throw new Error(`Unknown preset "${value}". Use one of: ${PRESET_NAMES.join(", ")}`);
-      }
-      options.preset = value;
-      index += 1;
-      continue;
-    }
-
     throw new Error(`Unknown option for init: ${arg}`);
-  }
-
-  return options;
-}
-
-function parsePresetArgs(args) {
-  if (!args || args.length === 0) {
-    throw new Error(`Missing preset subcommand. Use "rules-doctor preset apply <${PRESET_NAMES.join("|")}>".`);
-  }
-
-  const [subcommand, presetName, ...rest] = args;
-  if (subcommand !== "apply") {
-    throw new Error(`Unknown preset subcommand: ${subcommand}. Use "rules-doctor preset apply <preset>".`);
-  }
-
-  if (!presetName) {
-    throw new Error(`Missing preset name. Use one of: ${PRESET_NAMES.join(", ")}`);
-  }
-  if (!PRESET_NAMES.includes(presetName)) {
-    throw new Error(`Unknown preset "${presetName}". Use one of: ${PRESET_NAMES.join(", ")}`);
-  }
-
-  const options = {
-    presetName,
-    diff: false,
-    write: false,
-  };
-
-  for (const arg of rest) {
-    if (arg === "--diff") {
-      options.diff = true;
-      continue;
-    }
-    if (arg === "--write") {
-      options.write = true;
-      continue;
-    }
-    throw new Error(`Unknown option for preset apply: ${arg}`);
   }
 
   return options;
@@ -629,38 +1143,6 @@ function parseTargetedArgs(commandName, args, extra) {
     write: options.write,
     backup: options.backup,
   };
-}
-
-function parseAnalyzeArgs(args) {
-  const options = {
-    strict: false,
-  };
-
-  for (const arg of args || []) {
-    if (arg === "--strict") {
-      options.strict = true;
-      continue;
-    }
-    throw new Error(`Unknown option for analyze: ${arg}`);
-  }
-
-  return options;
-}
-
-function parseDoctorArgs(args) {
-  const options = {
-    strict: false,
-  };
-
-  for (const arg of args || []) {
-    if (arg === "--strict") {
-      options.strict = true;
-      continue;
-    }
-    throw new Error(`Unknown option for doctor: ${arg}`);
-  }
-
-  return options;
 }
 
 function getTargetConfig(rules, adapter) {
@@ -780,12 +1262,12 @@ function getSectionText(sections, aliases) {
 
 function collectImportSources(rootDir) {
   const candidates = [
-    { id: "claude", path: "CLAUDE.md" },
-    { id: "claude-local", path: ".claude/CLAUDE.md" },
-    { id: "codex", path: "AGENTS.md" },
-    { id: "copilot", path: ".github/copilot-instructions.md" },
-    { id: "gemini", path: "GEMINI.md" },
-    { id: "cursor", path: ".cursor/rules/rules-doctor.mdc" },
+    { path: "CLAUDE.md" },
+    { path: ".claude/CLAUDE.md" },
+    { path: "AGENTS.md" },
+    { path: ".github/copilot-instructions.md" },
+    { path: "GEMINI.md" },
+    { path: ".cursor/rules/rules-doctor.mdc" },
   ];
 
   const uniquePaths = new Set();
@@ -802,9 +1284,7 @@ function collectImportSources(rootDir) {
       continue;
     }
     sources.push({
-      id: item.id,
       path: item.path,
-      absolutePath,
       text: readFileSync(absolutePath, "utf8"),
     });
   }
@@ -821,7 +1301,6 @@ function importRulesFromDocs(rootDir, defaults) {
     return {
       rules: imported,
       report: "No existing docs were found. Created default rules.",
-      sources,
     };
   }
 
@@ -880,7 +1359,6 @@ function importRulesFromDocs(rootDir, defaults) {
   return {
     rules: imported,
     report: notes.join("\n"),
-    sources,
   };
 }
 
@@ -902,64 +1380,16 @@ function initCommand(rootDir, logger, args) {
     importReport = imported.report;
   }
 
-  rules = applyTargetPreset(rules, options.preset);
-
   ensureParentDirectory(rulesFile);
   writeFileSync(rulesFile, stringifyRules(rules), "utf8");
   logger.log(`Created ${rulesFile}`);
-  logger.log(`Applied target preset: ${options.preset}`);
 
   if (options.importExisting) {
     const reportPath = resolve(rootDir, IMPORT_REPORT_RELATIVE_PATH);
-    const reportContent =
-      options.preset === "all"
-        ? `${importReport}\n`
-        : `${importReport}\n\nApplied target preset: ${options.preset}\n`;
-    writeFileSync(reportPath, reportContent, "utf8");
+    writeFileSync(reportPath, `${importReport}\n`, "utf8");
     logger.log(`Import report: ${reportPath}`);
   }
 
-  return 0;
-}
-
-function presetApplyCommand(rootDir, logger, args) {
-  const options = parsePresetArgs(args);
-  const { rules, rulesFile } = loadRules(rootDir);
-  const nextRules = applyTargetPreset(
-    {
-      ...rules,
-      targets: { ...(rules.targets || {}) },
-    },
-    options.presetName,
-  );
-
-  const currentText = stringifyRules(rules);
-  const nextText = stringifyRules(nextRules);
-  const changed = currentText !== nextText;
-
-  logger.log("rules-doctor preset apply");
-  logger.log(`- root: ${rootDir}`);
-  logger.log(`- preset: ${options.presetName}`);
-  logger.log(`- mode: ${options.write ? "write" : "dry-run"}`);
-
-  if (options.diff && changed) {
-    logger.log("\n# diff: .agentrules/rules.yaml");
-    logger.log(renderSimpleDiff(currentText, nextText));
-  }
-
-  if (!changed) {
-    logger.log("No changes required: preset already applied.");
-    return 0;
-  }
-
-  if (!options.write) {
-    logger.log("Dry-run complete: rules.yaml would be updated. Re-run with --write.");
-    return 0;
-  }
-
-  ensureParentDirectory(rulesFile);
-  writeFileSync(rulesFile, nextText, "utf8");
-  logger.log(`Updated ${rulesFile}`);
   return 0;
 }
 
@@ -970,6 +1400,7 @@ function buildTargetPlans(rootDir, rules, targetIds) {
     const adapter = ADAPTERS_BY_ID[targetId];
     const target = getTargetConfig(rules, adapter);
     const targetPath = resolveInRoot(rootDir, target.path);
+    assertNoSymlinkTraversal(rootDir, targetPath);
     const fileExists = existsSync(targetPath);
     const currentText = fileExists ? readFileSync(targetPath, "utf8") : "";
 
@@ -1051,9 +1482,73 @@ function renderSimpleDiff(currentText, desiredText) {
 function formatPlanSummary(plans) {
   const changed = plans.filter((plan) => plan.changed).length;
   const changedFiles = new Set(plans.filter((plan) => plan.changed).map((plan) => plan.targetPath)).size;
-  const enabled = plans.filter((plan) => plan.enabled).length;
-  const disabled = plans.length - enabled;
-  return { changed, changedFiles, enabled, disabled };
+  return { changed, changedFiles };
+}
+
+function analyzeSharedPathPlans(plans) {
+  const groups = new Map();
+  for (const plan of plans) {
+    if (!plan.enabled) {
+      continue;
+    }
+    if (!groups.has(plan.targetPath)) {
+      groups.set(plan.targetPath, []);
+    }
+    groups.get(plan.targetPath).push(plan);
+  }
+
+  const shared = [];
+  const conflicts = [];
+  for (const plansAtPath of groups.values()) {
+    if (plansAtPath.length < 2) {
+      continue;
+    }
+
+    const ids = plansAtPath.map((plan) => plan.targetId);
+    const firstDesired = plansAtPath[0].desiredText;
+    const sameDesired = plansAtPath.every((plan) => plan.desiredText === firstDesired);
+    if (sameDesired) {
+      shared.push({
+        targetPathDisplay: plansAtPath[0].targetPathDisplay,
+        ids,
+      });
+      continue;
+    }
+
+    conflicts.push({
+      targetPathDisplay: plansAtPath[0].targetPathDisplay,
+      ids,
+    });
+  }
+
+  return { shared, conflicts };
+}
+
+function validateSyncPlans(plans) {
+  const mapping = analyzeSharedPathPlans(plans);
+  const issues = mapping.conflicts.map(
+    (group) =>
+      `Conflicting outputs map to the same file: ${group.ids.join(", ")} -> ${group.targetPathDisplay}`,
+  );
+  const warnings = [];
+
+  for (const plan of plans) {
+    if (!plan.enabled || !plan.exists || plan.adapter.management !== "marker") {
+      continue;
+    }
+    const marker = inspectMarkerBlock(
+      plan.currentText,
+      plan.adapter.markerBegin,
+      plan.adapter.markerEnd,
+    );
+    if (marker.status !== "valid" && marker.status !== "missing") {
+      warnings.push(
+        `${plan.targetId}: ${markerStatusIssueLabel(marker.status)} rules-doctor will repair it on sync.`,
+      );
+    }
+  }
+
+  return { issues, warnings };
 }
 
 function getUniqueWritePlans(plans) {
@@ -1092,7 +1587,7 @@ function getUniqueWritePlans(plans) {
 
 function syncCommand(rootDir, logger, args) {
   const options = parseTargetedArgs("sync", args, { write: true, backup: true });
-  const { rules } = loadRules(rootDir);
+  const { rules } = loadRules(rootDir, { logger });
   const plans = buildTargetPlans(rootDir, rules, options.targetIds);
   const summary = formatPlanSummary(plans);
 
@@ -1121,6 +1616,21 @@ function syncCommand(rootDir, logger, args) {
       logger.log(`\n# diff: ${plan.targetId} (${plan.targetPathDisplay})`);
       logger.log(renderSimpleDiff(plan.currentText, plan.desiredText));
     }
+  }
+
+  if (options.write) {
+    const preflight = validateSyncPlans(plans);
+    for (const warning of preflight.warnings) {
+      logger.log(`  warning: ${warning}`);
+    }
+    if (preflight.issues.length > 0) {
+      logger.log("Sync preflight failed:");
+      for (const issue of preflight.issues) {
+        logger.log(`  - ${issue}`);
+      }
+      return 1;
+    }
+    logger.log("Sync preflight passed.");
   }
 
   if (!options.write) {
@@ -1162,7 +1672,7 @@ function syncCommand(rootDir, logger, args) {
 
 function checkCommand(rootDir, logger, args) {
   const options = parseTargetedArgs("check", args, { write: false, backup: false });
-  const { rules } = loadRules(rootDir);
+  const { rules } = loadRules(rootDir, { logger });
   const plans = buildTargetPlans(rootDir, rules, options.targetIds);
   const summary = formatPlanSummary(plans);
 
@@ -1199,160 +1709,6 @@ function checkCommand(rootDir, logger, args) {
   return 1;
 }
 
-function analyzeCommand(rootDir, logger, args) {
-  const options = parseAnalyzeArgs(args);
-  const { rules, rulesExists, rulesFile } = loadRules(rootDir, { allowMissing: true });
-  const issues = [];
-  const targetSnapshots = [];
-
-  logger.log("rules-doctor analyze");
-  logger.log(`- rules.yaml: ${rulesExists ? "found" : "missing (using defaults)"}`);
-  logger.log(`- rules path: ${rulesFile}`);
-
-  for (const adapter of ADAPTERS) {
-    const target = getTargetConfig(rules, adapter);
-    const absolutePath = resolveInRoot(rootDir, target.path);
-    const fileExists = existsSync(absolutePath);
-    const content = fileExists ? readFileSync(absolutePath, "utf8") : "";
-
-    logger.log(
-      `- target ${adapter.id}: ${target.enabled ? "enabled" : "disabled"}, ${
-        fileExists ? "found" : "missing"
-      } (${target.path})`,
-    );
-
-    if (!target.enabled) {
-      continue;
-    }
-
-    if (!fileExists) {
-      issues.push(`${adapter.id}: expected file is missing (${target.path}).`);
-      continue;
-    }
-
-    if (adapter.management === "marker") {
-      const hasBegin = content.includes(adapter.markerBegin);
-      const hasEnd = content.includes(adapter.markerEnd);
-      if (!hasBegin || !hasEnd) {
-        issues.push(`${adapter.id}: marker block is missing.`);
-      }
-    }
-
-    if (!hasVerifyCommand(content)) {
-      issues.push(`${adapter.id}: verify commands (lint/test/build) not detected.`);
-    }
-
-    targetSnapshots.push({
-      id: adapter.id,
-      content,
-      asksApproval: hasAskApprovalLanguage(content),
-      noApproval: hasNoApprovalLanguage(content),
-      requiresTests: hasRequireTestsLanguage(content),
-      skipsTests: hasSkipTestsLanguage(content),
-    });
-  }
-
-  const askApprovalTargets = targetSnapshots.filter((item) => item.asksApproval).map((item) => item.id);
-  const noApprovalTargets = targetSnapshots.filter((item) => item.noApproval).map((item) => item.id);
-  if (askApprovalTargets.length > 0 && noApprovalTargets.length > 0) {
-    issues.push(
-      `Potential contradiction: approval guidance differs (${askApprovalTargets.join(
-        ", ",
-      )} vs ${noApprovalTargets.join(", ")}).`,
-    );
-  }
-
-  const requireTestsTargets = targetSnapshots
-    .filter((item) => item.requiresTests)
-    .map((item) => item.id);
-  const skipTestsTargets = targetSnapshots.filter((item) => item.skipsTests).map((item) => item.id);
-  if (requireTestsTargets.length > 0 && skipTestsTargets.length > 0) {
-    issues.push(
-      `Potential contradiction: test guidance differs (${requireTestsTargets.join(
-        ", ",
-      )} vs ${skipTestsTargets.join(", ")}).`,
-    );
-  }
-
-  logger.log("- Findings:");
-  if (issues.length === 0) {
-    logger.log("- No obvious issues found.");
-    return 0;
-  }
-
-  for (const issue of issues) {
-    logger.log(`- ${issue}`);
-  }
-
-  if (options.strict) {
-    throw new Error(`Analyze failed in strict mode with ${issues.length} issue(s).`);
-  }
-
-  return 0;
-}
-
-function doctorCommand(rootDir, logger, args) {
-  const options = parseDoctorArgs(args);
-  const { rules, rulesExists, rulesFile } = loadRules(rootDir, { allowMissing: true });
-  const issues = [];
-
-  logger.log("rules-doctor doctor");
-  logger.log(`- root: ${rootDir}`);
-  logger.log(`- rules file: ${rulesFile}`);
-  logger.log(`- rules exists: ${rulesExists ? "yes" : "no (defaults assumed)"}`);
-
-  const pathToTargets = {};
-  for (const adapter of ADAPTERS) {
-    const target = getTargetConfig(rules, adapter);
-    const absolutePath = resolveInRoot(rootDir, target.path);
-    const exists = existsSync(absolutePath);
-    const enabledText = target.enabled ? "enabled" : "disabled";
-    logger.log(`- ${adapter.id}: ${enabledText}, path=${target.path}, file=${exists ? "found" : "missing"}`);
-
-    if (!target.enabled) {
-      continue;
-    }
-
-    const key = absolutePath;
-    if (!pathToTargets[key]) {
-      pathToTargets[key] = [];
-    }
-    pathToTargets[key].push(adapter.id);
-  }
-
-  for (const path of Object.keys(pathToTargets)) {
-    const ids = pathToTargets[path];
-    if (ids.length > 1) {
-      issues.push(`Multiple enabled targets map to the same file: ${ids.join(", ")} -> ${path}`);
-    }
-  }
-
-  logger.log("- Findings:");
-  if (issues.length === 0) {
-    logger.log("- No structural issues found.");
-    return 0;
-  }
-  for (const issue of issues) {
-    logger.log(`- ${issue}`);
-  }
-
-  if (options.strict) {
-    return 1;
-  }
-  return 0;
-}
-
-function targetsListCommand(logger) {
-  logger.log("Supported targets:");
-  for (const adapter of ADAPTERS) {
-    const mode = adapter.management === "marker" ? "marker-managed" : "full-managed";
-    logger.log(`- ${adapter.id}: ${adapter.name}`);
-    logger.log(`  default path: ${adapter.defaultPath}`);
-    logger.log(`  mode: ${mode}`);
-    logger.log(`  ${adapter.description}`);
-  }
-}
-
 function runCli(argv, options) {
   const args = Array.isArray(argv) ? argv : [];
   const logger = createLogger(options || {});
@@ -1371,32 +1727,12 @@ function runCli(argv, options) {
       return initCommand(rootDir, logger, rest);
     }
 
-    if (command === "preset") {
-      return presetApplyCommand(rootDir, logger, rest);
-    }
-
     if (command === "sync") {
       return syncCommand(rootDir, logger, rest);
     }
 
     if (command === "check") {
       return checkCommand(rootDir, logger, rest);
-    }
-
-    if (command === "analyze") {
-      return analyzeCommand(rootDir, logger, rest);
-    }
-
-    if (command === "doctor") {
-      return doctorCommand(rootDir, logger, rest);
-    }
-
-    if (command === "targets") {
-      if (rest.length === 1 && rest[0] === "list") {
-        targetsListCommand(logger);
-        return 0;
-      }
-      throw new Error('Unknown targets command. Use "rules-doctor targets list".');
     }
 
     throw new Error(`Unknown command: ${command}\n\n${usage()}`);

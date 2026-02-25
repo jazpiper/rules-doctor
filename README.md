@@ -4,7 +4,6 @@
 
 It is optimized for real project adoption:
 - import existing docs (`init --import`)
-- target presets (`init --preset all|core|copilot`)
 - safe previews by default (`sync` is dry-run unless `--write`)
 - drift detection for CI (`check`)
 
@@ -33,23 +32,6 @@ npx rules-doctor init --import
 - Creates `.agentrules/rules.yaml`
 - Reads existing docs when found (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.cursor/rules/*.mdc`, `.github/copilot-instructions.md`)
 - Writes `.agentrules/import-report.md`
-
-Preset example (Copilot only):
-
-```bash
-npx rules-doctor init --preset copilot
-```
-
-Preset meanings:
-- `all`: all built-in targets enabled
-- `core`: `claude`, `codex`, `opencode`, `cursor`, `gemini`
-- `copilot`: only `copilot` enabled
-
-Apply preset to an existing `.agentrules/rules.yaml`:
-
-```bash
-npx rules-doctor preset apply copilot --write
-```
 
 ### 2) Preview changes safely
 
@@ -81,10 +63,6 @@ Returns non-zero when generated targets are out of sync.
 
 ## Supported Targets
 
-```bash
-npx rules-doctor targets list
-```
-
 Built-in adapters:
 - `claude` -> `CLAUDE.md` (full-managed)
 - `codex` -> `AGENTS.md` (marker-managed)
@@ -99,13 +77,6 @@ Built-in adapters:
 
 ```bash
 npx rules-doctor init [--import]
-npx rules-doctor init [--import] [--preset all|core|copilot]
-```
-
-### `preset apply`
-
-```bash
-npx rules-doctor preset apply <all|core|copilot> [--diff] [--write]
 ```
 
 ### `sync`
@@ -118,18 +89,6 @@ npx rules-doctor sync [--target all|claude,codex,...] [--diff] [--write] [--back
 
 ```bash
 npx rules-doctor check [--target all|claude,codex,...] [--diff]
-```
-
-### `analyze`
-
-```bash
-npx rules-doctor analyze [--strict]
-```
-
-### `doctor`
-
-```bash
-npx rules-doctor doctor [--strict]
 ```
 
 ## CI Template
@@ -166,7 +125,7 @@ jobs:
   - Or add an npm script in your project: `"rules:check": "rules-doctor check"`, then run `npm run rules:check`.
   - Global install (`npm i -g @jazpiper/rules-doctor`) works, but local + `npx` is safer for version consistency.
 - `init` says `rules.yaml already exists`:
-  - Use `npx rules-doctor preset apply <preset> --write` to change target defaults on an existing project.
+  - Edit `.agentrules/rules.yaml` directly, then run `npx rules-doctor sync --write`.
 
 ## Rules Schema (v2 Draft)
 
