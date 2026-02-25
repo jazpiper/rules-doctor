@@ -8,6 +8,10 @@ It is optimized for real project adoption:
 - drift detection for CI (`check`)
 
 All paths are resolved from project root (`.git` ancestor), not current subdirectory.
+For safety, target output paths must stay inside the project root:
+- absolute paths are rejected
+- `..` path escape is rejected
+- symlink traversal is rejected
 
 ## Install
 
@@ -126,6 +130,10 @@ jobs:
   - Global install (`npm i -g @jazpiper/rules-doctor`) works, but local + `npx` is safer for version consistency.
 - `init` says `rules.yaml already exists`:
   - Edit `.agentrules/rules.yaml` directly, then run `npx rules-doctor sync --write`.
+- `sync --write` fails with target path errors:
+  - Use project-relative paths only in `.agentrules/rules.yaml` (`targets.<id>.path`).
+  - Do not use absolute paths or `..` segments.
+  - Do not point managed outputs through symlink paths.
 
 ## Rules Schema (v2 Draft)
 
