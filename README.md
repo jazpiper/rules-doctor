@@ -74,3 +74,9 @@ npm run build
 
 MIT
 
+
+## CI
+
+This repo includes a GitHub Actions workflow template at `.github/workflows/ci.yml.example`.
+
+If you want CI, rename it to `.github/workflows/ci.yml` and push the change.
