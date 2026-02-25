@@ -139,7 +139,36 @@ You can disable or relocate any target by editing `targets.<id>.enabled/path`.
 
 ```bash
 npm ci
-npm run build
+npm test
+```
+
+## Release (maintainers)
+
+This repo includes a small release helper that:
+- runs tests
+- bumps version + creates git tag
+- pushes tags
+- publishes to npm using a token from a local file
+
+```bash
+npm run release:patch
+npm run release:minor
+npm run release:major
+```
+
+By default it reads the token from:
+- `/home/ubuntu/.openclaw/secrets/npm-token`
+
+Override with:
+
+```bash
+NPM_TOKEN_FILE=/path/to/token npm run release:patch
+```
+
+Tip: you can dry-run without tagging/publishing:
+
+```bash
+bash scripts/release.sh patch --dry-run
 ```
 
 ## License
