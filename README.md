@@ -77,6 +77,6 @@ MIT
 
 ## CI
 
-This repo includes a GitHub Actions workflow template at `.github/workflows/ci.yml.example`.
+This repo includes a GitHub Actions workflow template at `docs/workflows/ci.yml`.
 
-If you want CI, rename it to `.github/workflows/ci.yml` and push the change.
+If you want CI, copy it to `.github/workflows/ci.yml` and push the change.
