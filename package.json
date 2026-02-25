@@ -11,6 +11,7 @@
   "files": [
     "dist",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
@@ -26,10 +27,10 @@
     "rules",
     "claude",
     "codex",
+    "copilot",
     "cursor",
     "gemini",
-    "opencode",
-    "antigravity"
+    "opencode"
   ],
   "engines": {
     "node": ">=18"

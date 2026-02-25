@@ -22,6 +22,9 @@ targets:
   codex:
     enabled: true
     path: "AGENTS.md"
+  copilot:
+    enabled: true
+    path: ".github/copilot-instructions.md"
   cursor:
     enabled: true
     path: ".cursor/rules/rules-doctor.mdc"
@@ -31,6 +34,3 @@ targets:
   opencode:
     enabled: true
     path: "AGENTS.md"
-  antigravity:
-    enabled: true
-    path: "GEMINI.md"

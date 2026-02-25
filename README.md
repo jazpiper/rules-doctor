@@ -1,10 +1,14 @@
 # @jazpiper/rules-doctor
 
-`rules-doctor` is a Node.js CLI that keeps agent instruction files in sync from one source of truth: `.agentrules/rules.yaml`.
+`rules-doctor` keeps coding-rule files in sync across multiple agent CLIs from one source of truth: `.agentrules/rules.yaml`.
 
-It is designed for multi-agent workflows where each coding CLI reads a different file format.
+It is optimized for real project adoption:
+- import existing docs (`init --import`)
+- target presets (`init --preset all|core|copilot`)
+- safe previews by default (`sync` is dry-run unless `--write`)
+- drift detection for CI (`check`)
 
-By default, commands resolve paths relative to the project root (`.git` ancestor), not the current subdirectory.
+All paths are resolved from project root (`.git` ancestor), not current subdirectory.
 
 ## Install
 
@@ -12,128 +16,161 @@ By default, commands resolve paths relative to the project root (`.git` ancestor
 npm install -D @jazpiper/rules-doctor
 ```
 
-Or run directly:
+Run with:
 
 ```bash
-npx @jazpiper/rules-doctor init
+npx rules-doctor --help
 ```
 
-## Usage
+## Quick Start
 
-### 1) Initialize rules
+### 1) Initialize (recommended with import)
 
 ```bash
-rules-doctor init
+npx rules-doctor init --import
 ```
 
-Creates `.agentrules/rules.yaml` if it does not exist.
+- Creates `.agentrules/rules.yaml`
+- Reads existing docs when found (`CLAUDE.md`, `AGENTS.md`, `GEMINI.md`, `.cursor/rules/*.mdc`, `.github/copilot-instructions.md`)
+- Writes `.agentrules/import-report.md`
 
-- If `package.json` has scripts for `lint`, `test`, or `build`, they are inferred as:
-  - `npm run lint`
-  - `npm run test`
-  - `npm run build`
-- Missing scripts are created as TODO placeholders.
-
-### 2) Sync generated docs
+Preset example (Copilot only):
 
 ```bash
-rules-doctor sync
-rules-doctor sync --target claude
-rules-doctor sync --target codex
-rules-doctor sync --target cursor,gemini,opencode,antigravity
+npx rules-doctor init --preset copilot
 ```
 
-Generates/updates:
-- `CLAUDE.md` (`claude`, fully managed)
-- `AGENTS.md` (`codex`, `opencode`, marker-managed)
-- `.cursor/rules/rules-doctor.mdc` (`cursor`, fully managed)
-- `GEMINI.md` (`gemini`, fully managed)
-- `GEMINI.md` (`antigravity`, inferred-compatible mapping)
+Preset meanings:
+- `all`: all built-in targets enabled
+- `core`: `claude`, `codex`, `opencode`, `cursor`, `gemini`
+- `copilot`: only `copilot` enabled
 
-Managed marker block in `AGENTS.md`:
-
-```md
-<!-- RULES_DOCTOR:BEGIN -->
-... managed content ...
-<!-- RULES_DOCTOR:END -->
-```
-
-If markers are missing, a new managed block is appended to the end of `AGENTS.md`.
-
-### 3) Analyze docs
+Apply preset to an existing `.agentrules/rules.yaml`:
 
 ```bash
-rules-doctor analyze
+npx rules-doctor preset apply copilot --write
 ```
 
-Reads enabled target files from `rules.yaml`, then prints a concise report about:
-- missing markers
-- missing verify commands (`lint`/`test`/`build`)
-- obvious contradictions (simple heuristics across generated targets)
-
-`--strict` makes `analyze` fail with non-zero exit code when findings exist.
-
-### 4) List supported adapters
+### 2) Preview changes safely
 
 ```bash
-rules-doctor targets list
+npx rules-doctor sync --diff
 ```
 
-Shows built-in adapters and default file paths.
+`sync` is dry-run by default. Nothing is written yet.
 
-### 5) Directory/Path Notes
+### 3) Apply changes
 
-- `claude`: searches `CLAUDE.md` from current directory upward; also supports `.claude/CLAUDE.md` and `.claude/rules/*.md`.
-- `codex`: looks for `AGENTS.override.md` or `AGENTS.md` from project root down to current directory.
-- `opencode`: reads project `AGENTS.md`, plus user global `~/.config/opencode/AGENTS.md`.
-- `cursor`: project rules live in `.cursor/rules/*.mdc` (legacy `.cursorrules` still exists).
-- `gemini`: uses `GEMINI.md` in workspace/ancestor directories and `~/.gemini/GEMINI.md`.
-- `antigravity`: currently mapped to `GEMINI.md` as an inferred default; verify in your environment.
+```bash
+npx rules-doctor sync --write
+```
+
+Optional backups:
+
+```bash
+npx rules-doctor sync --write --backup
+```
+
+### 4) Verify drift in CI/local
+
+```bash
+npx rules-doctor check
+```
+
+Returns non-zero when generated targets are out of sync.
+
+## Supported Targets
+
+```bash
+npx rules-doctor targets list
+```
+
+Built-in adapters:
+- `claude` -> `CLAUDE.md` (full-managed)
+- `codex` -> `AGENTS.md` (marker-managed)
+- `copilot` -> `.github/copilot-instructions.md` (marker-managed, preserves existing text outside managed block)
+- `opencode` -> `AGENTS.md` (marker-managed)
+- `cursor` -> `.cursor/rules/rules-doctor.mdc` (full-managed)
+- `gemini` -> `GEMINI.md` (full-managed)
+
+## Command Reference
+
+### `init`
+
+```bash
+npx rules-doctor init [--import]
+npx rules-doctor init [--import] [--preset all|core|copilot]
+```
+
+### `preset apply`
+
+```bash
+npx rules-doctor preset apply <all|core|copilot> [--diff] [--write]
+```
+
+### `sync`
+
+```bash
+npx rules-doctor sync [--target all|claude,codex,...] [--diff] [--write] [--backup]
+```
+
+### `check`
+
+```bash
+npx rules-doctor check [--target all|claude,codex,...] [--diff]
+```
+
+### `analyze`
+
+```bash
+npx rules-doctor analyze [--strict]
+```
+
+### `doctor`
+
+```bash
+npx rules-doctor doctor [--strict]
+```
+
+## CI Template
+
+Copy [docs/workflows/rules-doctor-check.yml](docs/workflows/rules-doctor-check.yml) to your repository as `.github/workflows/rules-doctor-check.yml`.
+It runs `npx rules-doctor check` on push and pull requests.
+
+Inline workflow example:
+
+```yaml
+name: Rules Doctor Check
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rules-doctor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+      - run: npm ci
+      - run: npx rules-doctor check
+```
+
+## Troubleshooting
+
+- `rules-doctor: command not found` after `npm install -D @jazpiper/rules-doctor`:
+  - Use `npx rules-doctor ...` (recommended for local dev dependency).
+  - Or add an npm script in your project: `"rules:check": "rules-doctor check"`, then run `npm run rules:check`.
+  - Global install (`npm i -g @jazpiper/rules-doctor`) works, but local + `npx` is safer for version consistency.
+- `init` says `rules.yaml already exists`:
+  - Use `npx rules-doctor preset apply <preset> --write` to change target defaults on an existing project.
 
 ## Rules Schema (v2 Draft)
 
-`init` now creates a v2-compatible draft with `targets` configuration:
-
-```yaml
-version: 2
-mission: "Ship safe changes quickly while keeping agent instructions consistent."
-workflow:
-  - "Read relevant files before editing."
-  - "Make the smallest correct change."
-  - "Run verification commands before finalizing."
-commands:
-  lint: "npm run lint"
-  test: "npm run test"
-  build: "npm run build"
-done:
-  - "Commands pass or blockers are documented."
-  - "Changed behavior is reflected in docs where needed."
-approvals:
-  mode: "ask-before-destructive"
-  notes:
-    - "Ask before destructive actions or privileged operations."
-targets:
-  claude:
-    enabled: true
-    path: "CLAUDE.md"
-  codex:
-    enabled: true
-    path: "AGENTS.md"
-  cursor:
-    enabled: true
-    path: ".cursor/rules/rules-doctor.mdc"
-  gemini:
-    enabled: true
-    path: "GEMINI.md"
-  opencode:
-    enabled: true
-    path: "AGENTS.md"
-  antigravity:
-    enabled: true
-    path: "GEMINI.md"
-```
-
-You can disable or relocate any target by editing `targets.<id>.enabled/path`.
+See [docs/rules-v2-draft.yaml](docs/rules-v2-draft.yaml).
 
 ## Development
 
@@ -142,42 +179,6 @@ npm ci
 npm test
 ```
 
-## Release (maintainers)
-
-This repo includes a small release helper that:
-- runs tests
-- bumps version + creates git tag
-- pushes tags
-- publishes to npm using a token from a local file
-
-```bash
-npm run release:patch
-npm run release:minor
-npm run release:major
-```
-
-By default it reads the token from:
-- `/home/ubuntu/.openclaw/secrets/npm-token`
-
-Override with:
-
-```bash
-NPM_TOKEN_FILE=/path/to/token npm run release:patch
-```
-
-Tip: you can dry-run without tagging/publishing:
-
-```bash
-bash scripts/release.sh patch --dry-run
-```
-
 ## License
 
 MIT
-
-
-## CI
-
-This repo includes a GitHub Actions workflow template at `docs/workflows/ci.yml`.
-
-If you want CI, copy it to `.github/workflows/ci.yml` and push the change.

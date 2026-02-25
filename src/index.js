@@ -4,17 +4,26 @@ const { existsSync, mkdirSync, readFileSync, writeFileSync } = require("node:fs"
 const { ADAPTERS, ADAPTERS_BY_ID } = require("./adapters");
 
 const RULES_RELATIVE_PATH = ".agentrules/rules.yaml";
+const IMPORT_REPORT_RELATIVE_PATH = ".agentrules/import-report.md";
+const PRESET_NAMES = ["all", "core", "copilot"];
 
 function usage() {
   const targets = ADAPTERS.map((adapter) => adapter.id).join("|");
+  const presets = PRESET_NAMES.join("|");
   return [
     "rules-doctor",
     "",
     "Usage:",
-    "  rules-doctor init",
-    `  rules-doctor sync [--target all|${targets}|<comma-separated-targets>]`,
-    "  rules-doctor analyze",
+    `  rules-doctor init [--import] [--preset ${presets}]`,
+    `  rules-doctor preset apply <${presets}> [--diff] [--write]`,
+    `  rules-doctor sync [--target all|${targets}|<comma-separated-targets>] [--diff] [--write] [--backup]`,
+    `  rules-doctor check [--target all|${targets}|<comma-separated-targets>] [--diff]`,
+    "  rules-doctor analyze [--strict]",
+    "  rules-doctor doctor [--strict]",
     "  rules-doctor targets list",
+    "",
+    "Notes:",
+    "  - sync defaults to dry-run. Add --write to apply changes.",
   ].join("\n");
 }
 
@@ -239,6 +248,40 @@ function createDefaultRules(scripts) {
   };
 }
 
+function getPresetTargetIds(presetName) {
+  if (presetName === "all") {
+    return ADAPTERS.map((adapter) => adapter.id);
+  }
+
+  if (presetName === "core") {
+    return ["claude", "codex", "opencode", "cursor", "gemini"];
+  }
+
+  if (presetName === "copilot") {
+    return ["copilot"];
+  }
+
+  throw new Error(`Unknown preset "${presetName}". Use one of: ${PRESET_NAMES.join(", ")}`);
+}
+
+function applyTargetPreset(rules, presetName) {
+  const enabled = new Set(getPresetTargetIds(presetName));
+  const targets = rules.targets && typeof rules.targets === "object" ? rules.targets : {};
+
+  for (const adapter of ADAPTERS) {
+    const current = normalizeTargetConfig(targets[adapter.id], adapter.defaultPath);
+    targets[adapter.id] = {
+      enabled: enabled.has(adapter.id),
+      path: current.path,
+    };
+  }
+
+  return {
+    ...rules,
+    targets,
+  };
+}
+
 function normalizeTargetConfig(source, fallbackPath) {
   if (typeof source === "string" && source.trim()) {
     return { enabled: true, path: source.trim() };
@@ -275,7 +318,14 @@ function normalizeRules(input, defaults) {
 
   const targets = {};
   for (const adapter of ADAPTERS) {
-    targets[adapter.id] = normalizeTargetConfig(sourceTargets[adapter.id], defaults.targets[adapter.id].path);
+    const fallback = defaults.targets[adapter.id]
+      ? defaults.targets[adapter.id].path
+      : adapter.defaultPath;
+    const config = normalizeTargetConfig(sourceTargets[adapter.id], fallback);
+    targets[adapter.id] = {
+      enabled: typeof config.enabled === "boolean" ? config.enabled : true,
+      path: config.path,
+    };
   }
 
   for (const customId of Object.keys(sourceTargets)) {
@@ -464,43 +514,153 @@ function getTargetsFromSpec(spec) {
   return unique;
 }
 
-function parseSyncTargets(args) {
-  if (!args || args.length === 0) {
-    return ADAPTERS.map((adapter) => adapter.id);
-  }
+function parseInitArgs(args) {
+  const options = {
+    importExisting: false,
+    preset: "all",
+  };
 
-  let targetSpec = "all";
-  for (let index = 0; index < args.length; index += 1) {
+  for (let index = 0; index < (args || []).length; index += 1) {
     const arg = args[index];
-    if (arg === "--target") {
+    if (arg === "--import") {
+      options.importExisting = true;
+      continue;
+    }
+
+    if (arg === "--preset") {
       const value = args[index + 1];
       if (!value) {
-        throw new Error("Missing value for --target");
+        throw new Error("Missing value for --preset.");
       }
-      targetSpec = value;
+      if (!PRESET_NAMES.includes(value)) {
+        throw new Error(`Unknown preset "${value}". Use one of: ${PRESET_NAMES.join(", ")}`);
+      }
+      options.preset = value;
       index += 1;
       continue;
     }
 
-    throw new Error(`Unknown option for sync: ${arg}`);
+    throw new Error(`Unknown option for init: ${arg}`);
   }
 
-  return getTargetsFromSpec(targetSpec);
+  return options;
+}
+
+function parsePresetArgs(args) {
+  if (!args || args.length === 0) {
+    throw new Error(`Missing preset subcommand. Use "rules-doctor preset apply <${PRESET_NAMES.join("|")}>".`);
+  }
+
+  const [subcommand, presetName, ...rest] = args;
+  if (subcommand !== "apply") {
+    throw new Error(`Unknown preset subcommand: ${subcommand}. Use "rules-doctor preset apply <preset>".`);
+  }
+
+  if (!presetName) {
+    throw new Error(`Missing preset name. Use one of: ${PRESET_NAMES.join(", ")}`);
+  }
+  if (!PRESET_NAMES.includes(presetName)) {
+    throw new Error(`Unknown preset "${presetName}". Use one of: ${PRESET_NAMES.join(", ")}`);
+  }
+
+  const options = {
+    presetName,
+    diff: false,
+    write: false,
+  };
+
+  for (const arg of rest) {
+    if (arg === "--diff") {
+      options.diff = true;
+      continue;
+    }
+    if (arg === "--write") {
+      options.write = true;
+      continue;
+    }
+    throw new Error(`Unknown option for preset apply: ${arg}`);
+  }
+
+  return options;
+}
+
+function parseTargetedArgs(commandName, args, extra) {
+  const options = {
+    targetSpec: "all",
+    diff: false,
+    write: false,
+    backup: false,
+  };
+  const allowed = extra || {};
+
+  for (let index = 0; index < (args || []).length; index += 1) {
+    const arg = args[index];
+    if (arg === "--target") {
+      const value = args[index + 1];
+      if (!value) {
+        throw new Error(`Missing value for --target (${commandName})`);
+      }
+      options.targetSpec = value;
+      index += 1;
+      continue;
+    }
+    if (arg === "--diff") {
+      options.diff = true;
+      continue;
+    }
+    if (arg === "--write" && allowed.write) {
+      options.write = true;
+      continue;
+    }
+    if (arg === "--backup" && allowed.backup) {
+      options.backup = true;
+      continue;
+    }
+    throw new Error(`Unknown option for ${commandName}: ${arg}`);
+  }
+
+  if (options.backup && !options.write) {
+    throw new Error("--backup requires --write.");
+  }
+
+  return {
+    targetIds: getTargetsFromSpec(options.targetSpec),
+    diff: options.diff,
+    write: options.write,
+    backup: options.backup,
+  };
 }
 
 function parseAnalyzeArgs(args) {
-  if (!args || args.length === 0) {
-    return {};
-  }
+  const options = {
+    strict: false,
+  };
 
-  for (const arg of args) {
+  for (const arg of args || []) {
     if (arg === "--strict") {
-      return { strict: true };
+      options.strict = true;
+      continue;
     }
     throw new Error(`Unknown option for analyze: ${arg}`);
   }
 
-  return {};
+  return options;
+}
+
+function parseDoctorArgs(args) {
+  const options = {
+    strict: false,
+  };
+
+  for (const arg of args || []) {
+    if (arg === "--strict") {
+      options.strict = true;
+      continue;
+    }
+    throw new Error(`Unknown option for doctor: ${arg}`);
+  }
+
+  return options;
 }
 
 function getTargetConfig(rules, adapter) {
@@ -508,57 +668,535 @@ function getTargetConfig(rules, adapter) {
   return normalizeTargetConfig(source, adapter.defaultPath);
 }
 
-function initCommand(rootDir, logger) {
-  const rulesFile = resolve(rootDir, RULES_RELATIVE_PATH);
-  if (existsSync(rulesFile)) {
-    logger.log(`rules.yaml already exists: ${rulesFile}`);
-    return;
-  }
-
-  const defaults = createDefaultRules(loadPackageScripts(rootDir));
-  ensureParentDirectory(rulesFile);
-  writeFileSync(rulesFile, stringifyRules(defaults), "utf8");
-  logger.log(`Created ${rulesFile}`);
+function normalizeHeading(value) {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
 }
 
-function syncCommand(rootDir, logger, args) {
-  const { rules } = loadRules(rootDir);
-  const selectedTargetIds = parseSyncTargets(args);
+function parseMarkdownSections(text) {
+  const sections = {};
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  let currentHeading = null;
+  let currentLines = [];
 
-  let updated = 0;
-  for (const targetId of selectedTargetIds) {
-    const adapter = ADAPTERS_BY_ID[targetId];
-    const target = getTargetConfig(rules, adapter);
+  function flush() {
+    if (!currentHeading) {
+      return;
+    }
+    const normalized = normalizeHeading(currentHeading);
+    if (!sections[normalized]) {
+      sections[normalized] = currentLines.join("\n").trim();
+    }
+  }
 
-    if (!target.enabled) {
-      logger.log(`Skipped ${targetId} (disabled in rules.yaml).`);
+  for (const line of lines) {
+    const heading = line.match(/^#{1,6}\s+(.+?)\s*$/);
+    if (heading) {
+      flush();
+      currentHeading = heading[1];
+      currentLines = [];
       continue;
     }
 
-    const targetPath = resolveInRoot(rootDir, target.path);
-    const rendered = adapter.render(rules).trim();
-    ensureParentDirectory(targetPath);
+    if (currentHeading) {
+      currentLines.push(line);
+    }
+  }
 
-    if (adapter.management === "marker") {
-      const existing = existsSync(targetPath) ? readFileSync(targetPath, "utf8") : "";
-      const updatedText = upsertManagedSection(
-        existing,
-        rendered,
-        adapter.markerBegin,
-        adapter.markerEnd,
-      );
-      writeFileSync(targetPath, updatedText, "utf8");
-    } else {
-      writeFileSync(targetPath, `${rendered}\n`, "utf8");
+  flush();
+  return sections;
+}
+
+function pickFirstNonEmptyLine(text) {
+  for (const line of text.split("\n")) {
+    const trimmed = line.trim();
+    if (trimmed) {
+      return trimmed;
+    }
+  }
+  return "";
+}
+
+function parseListItems(text) {
+  const items = [];
+  for (const line of text.split("\n")) {
+    const bullet = line.match(/^\s*[-*]\s+(.+?)\s*$/);
+    if (bullet) {
+      items.push(bullet[1].trim());
+      continue;
+    }
+    const numbered = line.match(/^\s*\d+\.\s+(.+?)\s*$/);
+    if (numbered) {
+      items.push(numbered[1].trim());
+    }
+  }
+  return items;
+}
+
+function unquoteValue(value) {
+  let current = value.trim();
+  if (current.startsWith("`") && current.endsWith("`")) {
+    current = current.slice(1, -1);
+  }
+  current = stripQuotes(current);
+  return current.trim();
+}
+
+function importCommandsFromText(text, commands) {
+  const merged = { ...commands };
+  const lines = text.replace(/\r\n/g, "\n").split("\n");
+  const commandNames = Object.keys(merged);
+
+  for (const raw of lines) {
+    const line = raw.trim();
+    for (const name of commandNames) {
+      const direct = line.match(new RegExp(`^(?:[-*]\\s*)?${name}\\s*:\\s*(.+)$`, "i"));
+      if (direct && direct[1]) {
+        merged[name] = unquoteValue(direct[1]);
+      }
+    }
+  }
+
+  for (const name of commandNames) {
+    if (!merged[name] || merged[name].includes("TODO")) {
+      const found = text.match(new RegExp(`\\b(?:npm run|pnpm|yarn|bun)\\s+${name}\\b`, "i"));
+      if (found) {
+        merged[name] = found[0];
+      }
+    }
+  }
+
+  return merged;
+}
+
+function getSectionText(sections, aliases) {
+  for (const alias of aliases) {
+    const key = normalizeHeading(alias);
+    if (sections[key] && sections[key].trim()) {
+      return sections[key].trim();
+    }
+  }
+  return "";
+}
+
+function collectImportSources(rootDir) {
+  const candidates = [
+    { id: "claude", path: "CLAUDE.md" },
+    { id: "claude-local", path: ".claude/CLAUDE.md" },
+    { id: "codex", path: "AGENTS.md" },
+    { id: "copilot", path: ".github/copilot-instructions.md" },
+    { id: "gemini", path: "GEMINI.md" },
+    { id: "cursor", path: ".cursor/rules/rules-doctor.mdc" },
+  ];
+
+  const uniquePaths = new Set();
+  const sources = [];
+
+  for (const item of candidates) {
+    if (uniquePaths.has(item.path)) {
+      continue;
+    }
+    uniquePaths.add(item.path);
+
+    const absolutePath = resolveInRoot(rootDir, item.path);
+    if (!existsSync(absolutePath)) {
+      continue;
+    }
+    sources.push({
+      id: item.id,
+      path: item.path,
+      absolutePath,
+      text: readFileSync(absolutePath, "utf8"),
+    });
+  }
+
+  return sources;
+}
+
+function importRulesFromDocs(rootDir, defaults) {
+  const imported = JSON.parse(JSON.stringify(defaults));
+  const sources = collectImportSources(rootDir);
+  const notes = [];
+
+  if (sources.length === 0) {
+    return {
+      rules: imported,
+      report: "No existing docs were found. Created default rules.",
+      sources,
+    };
+  }
+
+  notes.push(`Found ${sources.length} source file(s):`);
+  for (const source of sources) {
+    notes.push(`- ${source.path}`);
+  }
+
+  for (const source of sources) {
+    const sections = parseMarkdownSections(source.text);
+
+    const missionSection = getSectionText(sections, ["mission"]);
+    if (missionSection) {
+      const mission = pickFirstNonEmptyLine(missionSection);
+      if (mission) {
+        imported.mission = mission;
+      }
     }
 
-    logger.log(`Updated ${targetPath} (${targetId})`);
-    updated += 1;
+    const workflowSection = getSectionText(sections, ["workflow", "operational loop"]);
+    const workflow = parseListItems(workflowSection);
+    if (workflow.length > 0) {
+      imported.workflow = workflow;
+    }
+
+    const doneSection = getSectionText(sections, ["done", "done criteria"]);
+    const done = parseListItems(doneSection);
+    if (done.length > 0) {
+      imported.done = done;
+    }
+
+    const approvalsSection = getSectionText(sections, ["approvals", "approval"]);
+    if (approvalsSection) {
+      const mode = approvalsSection.match(/(?:mode|policy)\s*:\s*`?([a-z0-9_-]+)`?/i);
+      if (mode && mode[1]) {
+        imported.approvals.mode = mode[1].trim();
+      }
+      const approvalNotes = parseListItems(approvalsSection);
+      if (approvalNotes.length > 0) {
+        imported.approvals.notes = approvalNotes;
+      }
+    }
+
+    imported.commands = importCommandsFromText(source.text, imported.commands);
   }
 
-  if (updated === 0) {
-    logger.log("No files updated.");
+  for (const adapter of ADAPTERS) {
+    const config = getTargetConfig(imported, adapter);
+    const absolutePath = resolveInRoot(rootDir, config.path);
+    if (existsSync(absolutePath)) {
+      imported.targets[adapter.id].enabled = true;
+    }
   }
+
+  notes.push("Imported mission/workflow/commands/done/approvals where detected.");
+  return {
+    rules: imported,
+    report: notes.join("\n"),
+    sources,
+  };
+}
+
+function initCommand(rootDir, logger, args) {
+  const options = parseInitArgs(args);
+  const rulesFile = resolve(rootDir, RULES_RELATIVE_PATH);
+  if (existsSync(rulesFile)) {
+    logger.log(`rules.yaml already exists: ${rulesFile}`);
+    return 0;
+  }
+
+  const defaults = createDefaultRules(loadPackageScripts(rootDir));
+  let rules = defaults;
+  let importReport = "";
+
+  if (options.importExisting) {
+    const imported = importRulesFromDocs(rootDir, defaults);
+    rules = imported.rules;
+    importReport = imported.report;
+  }
+
+  rules = applyTargetPreset(rules, options.preset);
+
+  ensureParentDirectory(rulesFile);
+  writeFileSync(rulesFile, stringifyRules(rules), "utf8");
+  logger.log(`Created ${rulesFile}`);
+  logger.log(`Applied target preset: ${options.preset}`);
+
+  if (options.importExisting) {
+    const reportPath = resolve(rootDir, IMPORT_REPORT_RELATIVE_PATH);
+    const reportContent =
+      options.preset === "all"
+        ? `${importReport}\n`
+        : `${importReport}\n\nApplied target preset: ${options.preset}\n`;
+    writeFileSync(reportPath, reportContent, "utf8");
+    logger.log(`Import report: ${reportPath}`);
+  }
+
+  return 0;
+}
+
+function presetApplyCommand(rootDir, logger, args) {
+  const options = parsePresetArgs(args);
+  const { rules, rulesFile } = loadRules(rootDir);
+  const nextRules = applyTargetPreset(
+    {
+      ...rules,
+      targets: { ...(rules.targets || {}) },
+    },
+    options.presetName,
+  );
+
+  const currentText = stringifyRules(rules);
+  const nextText = stringifyRules(nextRules);
+  const changed = currentText !== nextText;
+
+  logger.log("rules-doctor preset apply");
+  logger.log(`- root: ${rootDir}`);
+  logger.log(`- preset: ${options.presetName}`);
+  logger.log(`- mode: ${options.write ? "write" : "dry-run"}`);
+
+  if (options.diff && changed) {
+    logger.log("\n# diff: .agentrules/rules.yaml");
+    logger.log(renderSimpleDiff(currentText, nextText));
+  }
+
+  if (!changed) {
+    logger.log("No changes required: preset already applied.");
+    return 0;
+  }
+
+  if (!options.write) {
+    logger.log("Dry-run complete: rules.yaml would be updated. Re-run with --write.");
+    return 0;
+  }
+
+  ensureParentDirectory(rulesFile);
+  writeFileSync(rulesFile, nextText, "utf8");
+  logger.log(`Updated ${rulesFile}`);
+  return 0;
+}
+
+function buildTargetPlans(rootDir, rules, targetIds) {
+  const plans = [];
+
+  for (const targetId of targetIds) {
+    const adapter = ADAPTERS_BY_ID[targetId];
+    const target = getTargetConfig(rules, adapter);
+    const targetPath = resolveInRoot(rootDir, target.path);
+    const fileExists = existsSync(targetPath);
+    const currentText = fileExists ? readFileSync(targetPath, "utf8") : "";
+
+    if (!target.enabled) {
+      plans.push({
+        targetId,
+        adapter,
+        enabled: false,
+        targetPath,
+        targetPathDisplay: target.path,
+        exists: fileExists,
+        currentText,
+        desiredText: currentText,
+        changed: false,
+      });
+      continue;
+    }
+
+    const rendered = adapter.render(rules).trim();
+    const desiredText =
+      adapter.management === "marker"
+        ? upsertManagedSection(currentText, rendered, adapter.markerBegin, adapter.markerEnd)
+        : `${rendered}\n`;
+
+    plans.push({
+      targetId,
+      adapter,
+      enabled: true,
+      targetPath,
+      targetPathDisplay: target.path,
+      exists: fileExists,
+      currentText,
+      desiredText,
+      changed: desiredText !== currentText,
+    });
+  }
+
+  return plans;
+}
+
+function renderSimpleDiff(currentText, desiredText) {
+  if (currentText === desiredText) {
+    return "";
+  }
+
+  const oldLines = currentText.replace(/\r\n/g, "\n").split("\n");
+  const newLines = desiredText.replace(/\r\n/g, "\n").split("\n");
+  const output = ["--- current", "+++ desired"];
+  const maxLines = Math.max(oldLines.length, newLines.length);
+  const hardLimit = 120;
+  let emitted = 0;
+
+  for (let index = 0; index < maxLines; index += 1) {
+    const oldLine = oldLines[index];
+    const newLine = newLines[index];
+
+    if (oldLine === newLine) {
+      continue;
+    }
+
+    if (typeof oldLine !== "undefined") {
+      output.push(`-${oldLine}`);
+      emitted += 1;
+    }
+    if (typeof newLine !== "undefined") {
+      output.push(`+${newLine}`);
+      emitted += 1;
+    }
+
+    if (emitted >= hardLimit) {
+      output.push("... diff truncated ...");
+      break;
+    }
+  }
+
+  return output.join("\n");
+}
+
+function formatPlanSummary(plans) {
+  const changed = plans.filter((plan) => plan.changed).length;
+  const changedFiles = new Set(plans.filter((plan) => plan.changed).map((plan) => plan.targetPath)).size;
+  const enabled = plans.filter((plan) => plan.enabled).length;
+  const disabled = plans.length - enabled;
+  return { changed, changedFiles, enabled, disabled };
+}
+
+function getUniqueWritePlans(plans) {
+  const byPath = new Map();
+  const duplicates = [];
+
+  for (const plan of plans) {
+    if (!plan.enabled || !plan.changed) {
+      continue;
+    }
+
+    const existing = byPath.get(plan.targetPath);
+    if (!existing) {
+      byPath.set(plan.targetPath, plan);
+      continue;
+    }
+
+    if (existing.desiredText !== plan.desiredText) {
+      throw new Error(
+        `Conflicting outputs for ${plan.targetPathDisplay}: ${existing.targetId} and ${plan.targetId} produce different content.`,
+      );
+    }
+
+    duplicates.push({
+      targetPathDisplay: plan.targetPathDisplay,
+      winner: existing.targetId,
+      duplicate: plan.targetId,
+    });
+  }
+
+  return {
+    uniquePlans: Array.from(byPath.values()),
+    duplicates,
+  };
+}
+
+function syncCommand(rootDir, logger, args) {
+  const options = parseTargetedArgs("sync", args, { write: true, backup: true });
+  const { rules } = loadRules(rootDir);
+  const plans = buildTargetPlans(rootDir, rules, options.targetIds);
+  const summary = formatPlanSummary(plans);
+
+  logger.log("rules-doctor sync");
+  logger.log(`- root: ${rootDir}`);
+  logger.log(`- selected targets: ${options.targetIds.join(", ")}`);
+  logger.log(`- mode: ${options.write ? "write" : "dry-run"}`);
+
+  for (const plan of plans) {
+    if (!plan.enabled) {
+      logger.log(`- ${plan.targetId}: disabled (${plan.targetPathDisplay})`);
+      continue;
+    }
+    if (!plan.changed) {
+      logger.log(`- ${plan.targetId}: up-to-date (${plan.targetPathDisplay})`);
+      continue;
+    }
+    logger.log(`- ${plan.targetId}: would update (${plan.targetPathDisplay})`);
+  }
+
+  if (options.diff) {
+    for (const plan of plans) {
+      if (!plan.enabled || !plan.changed) {
+        continue;
+      }
+      logger.log(`\n# diff: ${plan.targetId} (${plan.targetPathDisplay})`);
+      logger.log(renderSimpleDiff(plan.currentText, plan.desiredText));
+    }
+  }
+
+  if (!options.write) {
+    if (summary.changed === 0) {
+      logger.log("Dry-run complete: no changes.");
+    } else {
+      logger.log(
+        `Dry-run complete: ${summary.changedFiles} file(s) would change (${summary.changed} target mappings). Re-run with --write.`,
+      );
+    }
+    return 0;
+  }
+
+  const { uniquePlans, duplicates } = getUniqueWritePlans(plans);
+  for (const duplicate of duplicates) {
+    logger.log(
+      `  note: ${duplicate.duplicate} shares output with ${duplicate.winner} at ${duplicate.targetPathDisplay}`,
+    );
+  }
+
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-");
+  for (const plan of uniquePlans) {
+    ensureParentDirectory(plan.targetPath);
+    if (options.backup && plan.exists) {
+      const backupPath = `${plan.targetPath}.rules-doctor.bak.${timestamp}`;
+      writeFileSync(backupPath, plan.currentText, "utf8");
+      logger.log(`  backup: ${backupPath}`);
+    }
+
+    writeFileSync(plan.targetPath, plan.desiredText, "utf8");
+    logger.log(`  updated: ${plan.targetPath}`);
+  }
+
+  logger.log(
+    `Write complete: ${uniquePlans.length} file(s) updated (${summary.changed} target mappings changed).`,
+  );
+  return 0;
+}
+
+function checkCommand(rootDir, logger, args) {
+  const options = parseTargetedArgs("check", args, { write: false, backup: false });
+  const { rules } = loadRules(rootDir);
+  const plans = buildTargetPlans(rootDir, rules, options.targetIds);
+  const summary = formatPlanSummary(plans);
+
+  logger.log("rules-doctor check");
+  logger.log(`- root: ${rootDir}`);
+  logger.log(`- selected targets: ${options.targetIds.join(", ")}`);
+
+  for (const plan of plans) {
+    if (!plan.enabled) {
+      logger.log(`- ${plan.targetId}: disabled (${plan.targetPathDisplay})`);
+      continue;
+    }
+    logger.log(
+      `- ${plan.targetId}: ${plan.changed ? "drift detected" : "in sync"} (${plan.targetPathDisplay})`,
+    );
+  }
+
+  if (options.diff) {
+    for (const plan of plans) {
+      if (!plan.enabled || !plan.changed) {
+        continue;
+      }
+      logger.log(`\n# diff: ${plan.targetId} (${plan.targetPathDisplay})`);
+      logger.log(renderSimpleDiff(plan.currentText, plan.desiredText));
+    }
+  }
+
+  if (summary.changed === 0) {
+    logger.log("Check complete: all selected targets are in sync.");
+    return 0;
+  }
+
+  logger.log(`Check failed: ${summary.changed} target file(s) need sync.`);
+  return 1;
 }
 
 function analyzeCommand(rootDir, logger, args) {
@@ -653,6 +1291,57 @@ function analyzeCommand(rootDir, logger, args) {
   return 0;
 }
 
+function doctorCommand(rootDir, logger, args) {
+  const options = parseDoctorArgs(args);
+  const { rules, rulesExists, rulesFile } = loadRules(rootDir, { allowMissing: true });
+  const issues = [];
+
+  logger.log("rules-doctor doctor");
+  logger.log(`- root: ${rootDir}`);
+  logger.log(`- rules file: ${rulesFile}`);
+  logger.log(`- rules exists: ${rulesExists ? "yes" : "no (defaults assumed)"}`);
+
+  const pathToTargets = {};
+  for (const adapter of ADAPTERS) {
+    const target = getTargetConfig(rules, adapter);
+    const absolutePath = resolveInRoot(rootDir, target.path);
+    const exists = existsSync(absolutePath);
+    const enabledText = target.enabled ? "enabled" : "disabled";
+    logger.log(`- ${adapter.id}: ${enabledText}, path=${target.path}, file=${exists ? "found" : "missing"}`);
+
+    if (!target.enabled) {
+      continue;
+    }
+
+    const key = absolutePath;
+    if (!pathToTargets[key]) {
+      pathToTargets[key] = [];
+    }
+    pathToTargets[key].push(adapter.id);
+  }
+
+  for (const path of Object.keys(pathToTargets)) {
+    const ids = pathToTargets[path];
+    if (ids.length > 1) {
+      issues.push(`Multiple enabled targets map to the same file: ${ids.join(", ")} -> ${path}`);
+    }
+  }
+
+  logger.log("- Findings:");
+  if (issues.length === 0) {
+    logger.log("- No structural issues found.");
+    return 0;
+  }
+  for (const issue of issues) {
+    logger.log(`- ${issue}`);
+  }
+
+  if (options.strict) {
+    return 1;
+  }
+  return 0;
+}
+
 function targetsListCommand(logger) {
   logger.log("Supported targets:");
   for (const adapter of ADAPTERS) {
@@ -679,17 +1368,27 @@ function runCli(argv, options) {
     }
 
     if (command === "init") {
-      initCommand(rootDir, logger);
-      return 0;
+      return initCommand(rootDir, logger, rest);
+    }
+
+    if (command === "preset") {
+      return presetApplyCommand(rootDir, logger, rest);
     }
 
     if (command === "sync") {
-      syncCommand(rootDir, logger, rest);
-      return 0;
+      return syncCommand(rootDir, logger, rest);
+    }
+
+    if (command === "check") {
+      return checkCommand(rootDir, logger, rest);
     }
 
     if (command === "analyze") {
       return analyzeCommand(rootDir, logger, rest);
+    }
+
+    if (command === "doctor") {
+      return doctorCommand(rootDir, logger, rest);
     }
 
     if (command === "targets") {
