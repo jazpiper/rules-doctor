@@ -1,6 +1,13 @@
 #!/usr/bin/env node
-const { mkdirSync, readFileSync, rmSync, writeFileSync } = require("node:fs");
-const { dirname, join, resolve } = require("node:path");
+const {
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} = require("node:fs");
+const { dirname, join, relative, resolve } = require("node:path");
 
 function parseArgs(argv) {
   const options = {
@@ -26,6 +33,23 @@ function parseArgs(argv) {
   return options;
 }
 
+function copyDirectory(sourceDir, outputDir) {
+  const entries = readdirSync(sourceDir);
+  for (const entry of entries) {
+    const sourcePath = join(sourceDir, entry);
+    const stat = statSync(sourcePath);
+    const outPath = join(outputDir, relative(sourceDir, sourcePath));
+
+    if (stat.isDirectory()) {
+      copyDirectory(sourcePath, outPath);
+      continue;
+    }
+
+    mkdirSync(dirname(outPath), { recursive: true });
+    writeFileSync(outPath, readFileSync(sourcePath, "utf8"), "utf8");
+  }
+}
+
 function main() {
   const options = parseArgs(process.argv.slice(2));
   if (!options.entry) {
@@ -33,6 +57,7 @@ function main() {
   }
 
   const entryPath = resolve(options.entry);
+  const sourceRoot = dirname(entryPath);
   const outDir = resolve("dist");
   const outFile = join(outDir, "index.js");
   const dtsFile = join(outDir, "index.d.ts");
@@ -41,11 +66,7 @@ function main() {
     rmSync(outDir, { recursive: true, force: true });
   }
 
-  mkdirSync(dirname(outFile), { recursive: true });
-
-  const source = readFileSync(entryPath, "utf8");
-  // Offline-safe build: source file is plain JS; just copy to dist.
-  writeFileSync(outFile, source, "utf8");
+  copyDirectory(sourceRoot, outDir);
 
   if (options.dts) {
     writeFileSync(dtsFile, "export {};\n", "utf8");
@@ -61,4 +82,3 @@ try {
   console.error(`Build failed: ${message}`);
   process.exitCode = 1;
 }
-

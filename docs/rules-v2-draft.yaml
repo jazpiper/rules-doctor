@@ -1,0 +1,36 @@
+version: 2
+mission: "Ship safe changes quickly while keeping agent instructions consistent."
+workflow:
+  - "Read relevant files before editing."
+  - "Make the smallest correct change."
+  - "Run verification commands before finalizing."
+commands:
+  lint: "npm run lint"
+  test: "npm run test"
+  build: "npm run build"
+done:
+  - "Commands pass or blockers are documented."
+  - "Changed behavior is reflected in docs where needed."
+approvals:
+  mode: "ask-before-destructive"
+  notes:
+    - "Ask before destructive actions or privileged operations."
+targets:
+  claude:
+    enabled: true
+    path: "CLAUDE.md"
+  codex:
+    enabled: true
+    path: "AGENTS.md"
+  cursor:
+    enabled: true
+    path: ".cursor/rules/rules-doctor.mdc"
+  gemini:
+    enabled: true
+    path: "GEMINI.md"
+  opencode:
+    enabled: true
+    path: "AGENTS.md"
+  antigravity:
+    enabled: true
+    path: "GEMINI.md"
