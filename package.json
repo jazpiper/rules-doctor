@@ -1,0 +1,29 @@
+{
+  "name": "@jazpiper/rules-doctor",
+  "version": "0.1.0",
+  "description": "Node.js CLI to keep agent rules in sync across CLAUDE.md and AGENTS.md",
+  "license": "MIT",
+  "bin": {
+    "rules-doctor": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "node scripts/tsup.js src/index.ts --format cjs --dts --clean"
+  },
+  "keywords": [
+    "cli",
+    "agents",
+    "rules",
+    "claude",
+    "codex"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
